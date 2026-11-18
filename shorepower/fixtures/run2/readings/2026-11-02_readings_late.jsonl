@@ -1,0 +1,3 @@
+{"reading_id":"R101","revision":2,"meter_id":"M1","sampled_at_utc":"2026-11-03T00:00:00Z","unit":"Wh","cumulative":"11900"}
+{"reading_id":"R604","revision":1,"meter_id":"M6","sampled_at_utc":"2026-11-04T04:00:00Z","unit":"Wh","cumulative":"24000"}
+{"reading_id":"R703","revision":1,"meter_id":"M7","sampled_at_utc":"2026-11-03T16:00:00Z","unit":"Wh","cumulative":"4000"}
