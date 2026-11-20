@@ -11,14 +11,14 @@
  *   7. 启动临时 HTTP 服务，验证单发布快照查询与跨日结果。
  */
 
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-import { runFull, rerunDay } from '../src/pipeline.js';
-import { cleanupStaging, loadCurrentPublication } from '../src/storage.js';
+import { rerunDay, revokeBatch, runFull } from '../src/pipeline.js';
+import { cleanupStaging, loadCurrentPublication, loadPublication } from '../src/storage.js';
 import { startHttpServer } from '../src/server.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -149,7 +149,7 @@ async function main(): Promise<void> {
 
   // 4. 相同输入再重跑：幂等
   console.log('\n④ 相同输入再次重跑，验证幂等（不产生重复发布）');
-  const third = await rerunDay(inputDir, dataDir, '2026-11-04');
+  const third = await rerunDay(inputDir, dataDir, '2026-11-04', { cleanDelivery: false });
   checkTrue('重复运行被跳过', third.skipped);
   check('指针仍指向上一完整发布', third.publicationId, pub2.manifest.publicationId);
 
@@ -196,9 +196,43 @@ async function main(): Promise<void> {
   checkTrue('历史发布可枚举', (pubs.allPublicationIds?.length ?? 0) >= 2);
   await handle.close();
 
+  // 7. 撤销补发批次：回退旧修订，保留独立更正，发布成功后投递文件已清走
+  console.log('\n⑦ 撤销补发批次：按剩余有效批次回退修订，只重算受影响接电');
+  const suppBatchId = second.batchId;
+  checkTrue('补发形成可撤销批次', !!suppBatchId);
+  check('补发投递文件已被清走（撤销不依赖输入目录）', (await readdir(inputDir, { recursive: true })).filter((f) => /\.(csv|jsonl)$/i.test(f)), []);
+
+  const preview = await revokeBatch(dataDir, { batchId: suppBatchId!, dryRun: true });
+  check('预览撤销列出的受影响接电', preview.affectedConnectionIds.sort(), ['CONN-101', 'CONN-106', 'CONN-107']);
+  checkTrue('预览不产生发布', preview.publicationId === null);
+
+  const revoked = await revokeBatch(dataDir, { batchId: suppBatchId!, note: '补发数据有误' });
+  checkTrue('撤销产生新发布', !revoked.skipped);
+  check('撤销只重算受影响的 3 次接电', revoked.recomputedConnectionIds.sort(), ['CONN-101', 'CONN-106', 'CONN-107']);
+  const pub3 = await loadCurrentPublication(dataDir);
+  if (!pub3) throw new Error('撤销后读不到当前发布');
+  const acc3 = (id: string, day: string) =>
+    pub3.accounts.find((a) => a.connectionId === id && a.beijingDay === day);
+  // 旧修订恢复
+  check('撤销后 CONN-101 回到旧修订用量(Wh)', acc3('CONN-101', '2026-11-03')?.usageWh, 16000);
+  check('撤销后 CONN-101 修订号回到 1', acc3('CONN-101', '2026-11-03')?.revision, 1);
+  check('撤销后 CONN-106 恢复 rev1 用量(Wh)', acc3('CONN-106', '2026-11-04')?.usageWh, 18000);
+  checkTrue('撤销后 CONN-107 回到隔离', pub3.quarantines.some((q) => q.connectionId === 'CONN-107'));
+  // 未受影响接电沿用
+  check('CONN-102 不受撤销影响', acc3('CONN-102', '2026-11-03')?.usageWh, 9500);
+  check('当前发布已记录撤销批次', pub3.manifest.revokedBatchIds, [suppBatchId]);
+  // 已发布历史快照仍可查（含补发后的结果）
+  const pub2Again = await loadPublication(dataDir, pub2.manifest.publicationId);
+  check('撤销前的历史发布仍可查（CONN-107 日账仍在）', pub2Again?.accounts.filter((a) => a.connectionId === 'CONN-107').length, 2);
+  const oldLin = pub2Again?.lineage.find((l) => l.subjectDocId === 'DAILY-CONN-107-2026-11-04');
+  checkTrue('历史血缘仍含补发读数出处', JSON.stringify(oldLin ?? {}).includes('R703'));
+  // 幂等重试
+  const retry = await revokeBatch(dataDir, { batchId: suppBatchId! });
+  checkTrue('重复撤销幂等跳过', retry.skipped);
+
   console.log('\n────────────── 演示小结 ──────────────');
   console.log(`工作目录（临时）：${work}`);
-  console.log('存储布局：data/publications/<pub-id>/{daily-accounts,quarantines,lineage}.jsonl + manifest.json');
+  console.log('存储布局：data/publications/<pub-id>/{daily-accounts,quarantines,lineage,batches,batch-records}.jsonl + manifest.json');
   if (failures === 0) {
     console.log('全部检查通过 ✅');
   } else {

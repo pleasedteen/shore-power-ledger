@@ -78,9 +78,10 @@ test('全量 -> 指定日重跑：纳入重叠接电、替换撤下、其余沿�
 });
 
 test('全量输入视图（all-in-one）一次跑通，重送文件被识别', async () => {
-  const { root, data } = await freshDirs();
+  const { root, input, data } = await freshDirs();
   after(() => rm(root, { recursive: true, force: true }));
-  const input = allInOne; // 直接复用提交的夹具目录
+  // 发布成功后会清走投递文件，因此拷贝夹具副本，避免改动仓库内夹具
+  await copyStage(allInOne, input);
   const out = await runFull(input, data);
   assert.equal(out.accountCount, 7);
   assert.equal(out.quarantineCount, 3);

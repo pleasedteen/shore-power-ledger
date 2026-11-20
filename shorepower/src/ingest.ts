@@ -22,11 +22,20 @@ import type {
   SourceRef,
 } from './types.js';
 
+export interface IngestedFile {
+  file: InputFileInfo;
+  connections: ConnectionRecord[];
+  readings: MeterReading[];
+}
+
 export interface IngestResult {
+  /** 跨全部文件按最高修订合并后的视图（兼容非批次调用方） */
   connections: ConnectionRecord[];
   readings: MeterReading[];
   files: InputFileInfo[];
   warnings: string[];
+  /** 按文件分组的原始记录（每条只带本文件出处），供构建可撤销批次 */
+  fileGroups: IngestedFile[];
 }
 
 function sha256(buf: Buffer): string {
@@ -178,6 +187,33 @@ function parseReadingJsonl(
   return rows;
 }
 
+/** 单行接电记录 -> 记录对象（只带本行出处） */
+function rawConnectionToRecord(r: RawConnection): ConnectionRecord {
+  return {
+    connectionId: r.connectionId,
+    revision: r.revision,
+    vessel: r.vessel,
+    meterId: r.meterId,
+    startBeijingMs: r.startBeijingMs,
+    endBeijingMs: r.endBeijingMs,
+    sources: [r.source],
+  };
+}
+
+/** 单行读数记录 -> 记录对象（只带本行出处） */
+function rawReadingToRecord(r: RawReading): MeterReading {
+  return {
+    readingId: r.readingId,
+    revision: r.revision,
+    meterId: r.meterId,
+    sampledAtMs: r.sampledAtMs,
+    cumulativeWh: r.cumulativeWh,
+    originalUnit: r.originalUnit,
+    originalValue: r.originalValue,
+    sources: [r.source],
+  };
+}
+
 /**
  * 合并同主键记录：最高 revision 为准。
  * 同 revision 重复出现时，内容一致则合并出处，不一致则保留先到者并告警。
@@ -261,6 +297,7 @@ export async function ingest(inputDir: string): Promise<IngestResult> {
   const rawReadings: RawReading[] = [];
   const warnings: string[] = [];
   const seenHash = new Map<string, string>();
+  const fileGroups: IngestedFile[] = [];
 
   // 文件名排序保证处理顺序确定（乱序重送不影响结果）
   const candidates = entries
@@ -273,12 +310,13 @@ export async function ingest(inputDir: string): Promise<IngestResult> {
     const rel = path.relative(inputDir, abs);
     const buf = await readFile(abs);
     const hash = sha256(buf);
+    const encoding = /\.csv$/i.test(rel) ? 'GB18030' : 'UTF-8';
     const dupOf = seenHash.get(hash);
     if (dupOf) {
       // 完全相同的重送文件：登记但跳过解析
       files.push({
         file: rel,
-        encoding: /\.csv$/i.test(rel) ? 'GB18030' : 'UTF-8',
+        encoding,
         sha256: hash,
         sizeBytes: buf.length,
         duplicateOf: dupOf,
@@ -287,14 +325,28 @@ export async function ingest(inputDir: string): Promise<IngestResult> {
     }
     seenHash.set(hash, rel);
 
+    const info: InputFileInfo = { file: rel, encoding, sha256: hash, sizeBytes: buf.length };
     if (/\.csv$/i.test(rel)) {
       const text = decodeGb18030(buf);
-      rawConnections.push(...parseConnectionCsv(text, rel, hash));
-      files.push({ file: rel, encoding: 'GB18030', sha256: hash, sizeBytes: buf.length });
+      const parsed = parseConnectionCsv(text, rel, hash);
+      rawConnections.push(...parsed);
+      files.push(info);
+      fileGroups.push({
+        file: info,
+        // 保留文件内的全部行（含同主键的不同修订）；最高修订与冲突由批次选取统一判定
+        connections: parsed.map((r) => rawConnectionToRecord(r)),
+        readings: [],
+      });
     } else {
       const text = decodeUtf8(buf);
-      rawReadings.push(...parseReadingJsonl(text, rel, hash));
-      files.push({ file: rel, encoding: 'UTF-8', sha256: hash, sizeBytes: buf.length });
+      const parsed = parseReadingJsonl(text, rel, hash);
+      rawReadings.push(...parsed);
+      files.push(info);
+      fileGroups.push({
+        file: info,
+        connections: [],
+        readings: parsed.map((r) => rawReadingToRecord(r)),
+      });
     }
   }
 
@@ -304,5 +356,6 @@ export async function ingest(inputDir: string): Promise<IngestResult> {
     // 按相对路径排序，保证重跑时输入文件清单（进而发布指纹）确定
     files: files.sort((a, b) => a.file.localeCompare(b.file)),
     warnings,
+    fileGroups,
   };
 }

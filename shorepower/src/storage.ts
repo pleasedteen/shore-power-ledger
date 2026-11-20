@@ -18,10 +18,12 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type {
+  BatchRecord,
   DailyAccount,
   LineageRecord,
   PublicationManifest,
   QuarantineEntry,
+  SourceBatch,
 } from './types.js';
 
 export interface PublicationBundle {
@@ -29,6 +31,10 @@ export interface PublicationBundle {
   accounts: DailyAccount[];
   quarantines: QuarantineEntry[];
   lineage: LineageRecord[];
+  /** 批次台账（旧的非批次发布为空） */
+  batches: SourceBatch[];
+  /** 各有效批次的原始记录，撤销时据此按主键版本重选，不依赖已被清走的投递文件 */
+  batchRecords: BatchRecord[];
 }
 
 const PUBLICATIONS_DIR = 'publications';
@@ -114,13 +120,23 @@ export async function loadPublication(
 ): Promise<PublicationBundle | null> {
   const dir = path.join(publicationsRoot(dataDir), publicationId);
   try {
-    const [manifest, accounts, quarantines, lineage] = await Promise.all([
+    const [manifest, accounts, quarantines, lineage, batches, batchRecords] = await Promise.all([
       readFile(path.join(dir, 'manifest.json'), 'utf-8').then((t) => JSON.parse(t) as PublicationManifest),
       readJsonl<DailyAccount>(path.join(dir, 'daily-accounts.jsonl')),
       readJsonl<QuarantineEntry>(path.join(dir, 'quarantines.jsonl')),
       readJsonl<LineageRecord>(path.join(dir, 'lineage.jsonl')),
+      readJsonl<SourceBatch>(path.join(dir, 'batches.jsonl')),
+      readJsonl<BatchRecord>(path.join(dir, 'batch-records.jsonl')),
     ]);
-    return { manifest, accounts, quarantines, lineage };
+    // 旧版发布没有批次台账：补齐为合法空集，避免加载失败
+    return {
+      manifest: { ...manifest, activeBatchIds: manifest.activeBatchIds ?? [], revokedBatchIds: manifest.revokedBatchIds ?? [] },
+      accounts,
+      quarantines,
+      lineage,
+      batches,
+      batchRecords,
+    };
   } catch {
     return null;
   }
@@ -139,12 +155,17 @@ export async function listPublicationIds(dataDir: string): Promise<string[]> {
  * 原子发布：先写临时目录，全部文件落盘后 rename 为正式目录，再切换指针。
  * 任一步失败/进程退出，current.json 都保持指向上一完整发布。
  *
+ * 批次台账（batches.jsonl）与批次原始记录（batch-records.jsonl）和日账一起
+ * 写入同一目录、随指针一次切换，因此“撤销批次”的状态与账永远同进同退。
+ *
  * @param tombstoneDocIds 截至本次发布的全部撤下文档 id（历史墓碑 + 本次新增）
+ * @param hooks 测试用故障注入点（afterStaging 抛错可模拟发布中断）
  */
 export async function commitPublication(
   dataDir: string,
   bundle: PublicationBundle,
   tombstoneDocIds: string[],
+  hooks?: CommitHooks,
 ): Promise<{ publicationId: string; skipped: false }> {
   const root = publicationsRoot(dataDir);
   await mkdir(root, { recursive: true });
@@ -157,8 +178,13 @@ export async function commitPublication(
     writeFile(path.join(tmpDir, 'daily-accounts.jsonl'), toJsonl(bundle.accounts)),
     writeFile(path.join(tmpDir, 'quarantines.jsonl'), toJsonl(bundle.quarantines)),
     writeFile(path.join(tmpDir, 'lineage.jsonl'), toJsonl(bundle.lineage)),
+    writeFile(path.join(tmpDir, 'batches.jsonl'), toJsonl(bundle.batches)),
+    writeFile(path.join(tmpDir, 'batch-records.jsonl'), toJsonl(bundle.batchRecords)),
     writeFile(path.join(tmpDir, 'manifest.json'), JSON.stringify(bundle.manifest, null, 2) + '\n'),
   ]);
+
+  // 故障注入：此时正式目录尚未出现、指针未切换，模拟进程在发布中途退出
+  if (hooks?.afterStaging) await hooks.afterStaging();
 
   await rename(tmpDir, finalDir);
   // 指针写入同目录临时文件后原子替换；墓碑随指针一并持久化
@@ -172,6 +198,12 @@ export async function commitPublication(
   return { publicationId, skipped: false };
 }
 
+/** 发布故障注入钩子（仅测试使用） */
+export interface CommitHooks {
+  /** 在暂存目录写完、正式 rename 与指针切换之前调用；抛错即模拟中断 */
+  afterStaging?: () => void | Promise<void>;
+}
+
 /**
  * 幂等指纹：对发布的业务内容做规范化哈希。
  * 剔除 publicationId/createdAt 等易变字段，相同输入重跑得到相同指纹，
@@ -182,6 +214,8 @@ export function contentFingerprint(bundle: {
   accounts: DailyAccount[];
   quarantines: QuarantineEntry[];
   lineage: LineageRecord[];
+  batches?: SourceBatch[];
+  batchRecords?: BatchRecord[];
 }): string {
   // 清单运行时仍带 publicationId/createdAtMs（类型上 Omit 仅为编译期约束），
   // 这里显式剔除，避免易变字段污染指纹。
@@ -196,6 +230,10 @@ export function contentFingerprint(bundle: {
     accounts: bundle.accounts.map((d) => stripVolatile(d)),
     quarantines: bundle.quarantines.map((d) => stripVolatile(d)),
     lineage: bundle.lineage.map((d) => stripVolatile(d)),
+    // 批次台账参与指纹：撤销批次必须产生新的发布；但仅时间戳变化（重试同一撤销）
+    // 不应导致重复发布，故批次状态参与、updatedAtMs/revokedAtMs 剔除。
+    batches: (bundle.batches ?? []).map((b) => stripVolatile({ ...b, updatedAtMs: undefined, revokedAtMs: undefined })),
+    batchRecords: (bundle.batchRecords ?? []).map((r) => stripVolatile(r)),
   };
   return createHash('sha256').update(canonicalJson(stable)).digest('hex');
 }

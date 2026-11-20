@@ -106,8 +106,23 @@ export async function startHttpServer(dataDir: string, requestedPort: number): P
             snapshot,
             allPublicationIds: await listPublicationIds(dataDir),
             manifest: bundle.manifest,
+            batches: bundle.batches,
           });
           return;
+        case '/batches': {
+          // 批次台账（含已撤销批次），便于核对撤销依据与历史
+          sendJson(res, 200, {
+            snapshot,
+            count: bundle.batches.length,
+            activeBatchIds: bundle.manifest.activeBatchIds,
+            revokedBatchIds: bundle.manifest.revokedBatchIds,
+            batches: bundle.batches.map((b) => ({
+              ...b,
+              recordCount: bundle.batchRecords.filter((r) => r.batchId === b.batchId).length,
+            })),
+          });
+          return;
+        }
         case '/accounts': {
           let rows = bundle.accounts;
           const day = p.get('day');
@@ -171,6 +186,7 @@ export async function startHttpServer(dataDir: string, requestedPort: number): P
               '/quarantines?connectionId=',
               '/lineage?docId=',
               '/connection?id=',
+              '/batches',
             ],
           });
       }

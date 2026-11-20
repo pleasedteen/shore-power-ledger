@@ -14,7 +14,7 @@
 
 ```bash
 npm install
-npm run demo        # 端到端演示：生成夹具 → 发布 → 补发更正重跑 → 幂等 → HTTP 查询
+npm run demo        # 端到端演示：生成夹具 → 首次导入 → 补发重跑 → 幂等 → HTTP 查询 → 撤销批次
 ```
 
 `npm run demo` 在普通笔记本上约 1 秒完成（远低于 80 秒要求），全程使用系统临时目录，
@@ -23,7 +23,7 @@ npm run demo        # 端到端演示：生成夹具 → 发布 → 补发更正
 其它常用命令：
 
 ```bash
-npm test            # node:test 单元 + 集成测试（18 个用例）
+npm test            # node:test 单元 + 集成测试（26 个用例）
 npm run build       # TypeScript 类型检查并编译到 dist/
 npm run gen:fixtures  # 重新生成双源夹具到 fixtures/
 ```
@@ -73,15 +73,37 @@ CONN-101,1,远洋之星,M1,2026-11-03 08:00:00,2026-11-04 08:00:00
 ## 4. 运行与发布
 
 ```bash
-# 全量结算输入目录中的全部接电并发布
+# 首次导入：结算输入目录中的全部接电并发布，登记“首次导入”批次
 npx tsx src/cli.ts run --input ./input --data ./data
+
+# 补发 / 更正投递：登记新批次，自动只重算被影响的接电
+npx tsx src/cli.ts ingest --input ./input --data ./data
 
 # 指定北京时间自然日重跑
 npx tsx src/cli.ts rerun --day 2026-11-04 --input ./input --data ./data
 
+# 撤销来源批次（先 --dry-run 预览，再实际撤销；按剩余有效批次重选修订）
+npx tsx src/cli.ts revoke --batch B-correction-xxxxxxxxxxxx --dry-run --data ./data
+npx tsx src/cli.ts revoke --batch B-correction-xxxxxxxxxxxx --note 补发有误 --data ./data
+
 # 启动查询服务
 npx tsx src/cli.ts serve --data ./data --port 8080
 ```
+
+默认每次发布成功后都会**清走本次投递的文件**（只删输入目录内、本次实际纳入批次的文件）；
+加 `--keep-delivery` 可保留。批次台账与批次内原始记录已随发布落盘，因此清走投递文件后
+撤销、重试仍可完整进行。
+
+### 可撤销来源批次
+
+- **首次导入**与每次**补发 / 更正**各自形成一个来源批次，批次 id 由种类 + 文件内容 SHA-256 派生；
+- 同一组文件重复投递只复用已有批次；字节级重送文件在清单中记为 `duplicateOf`；
+- 参与结算的永远是“全部有效（未撤销）批次”按主键选出的最高修订，后到批次自然覆盖先到批次；
+- 撤销某批次时**不扫描输入目录**：只读取该批次涉及的主键版本与相关接电的结算输入，
+  按剩余有效批次重新选修订，只重算**真正受影响的接电**（接电记录或窗口内读数集合发生变化者），
+  其余接电与后来独立生效的更正原样沿用；
+- 撤销状态与日账、隔离、血缘写入**同一次原子发布**，中断后再次执行同一撤销即可完成；
+- 已发布的历史快照不受影响，`GET /publications?publicationId=<id>` 仍可查撤销前的日账与血缘。
 
 ### 重跑语义
 
@@ -98,7 +120,7 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 - 每次发布写入不可变目录 `publications/pub-<mode>-<时间戳>-<随机>/`，
   先写临时目录再原子 `rename`，最后原子切换 `current.json` 指针；
 - 发布中途退出不会改动指针，最近一次完整发布始终可查，重跑可完成更新；
-- 发布内容带规范化 SHA-256 指纹，**相同输入重跑指纹一致，自动跳过、不产生重复发布**；
+- 发布内容带规范化 SHA-256 指纹，**相同批次状态与结算结果重跑指纹一致，自动跳过、不产生重复发布**；
 - 撤下记录（墓碑）随指针持久化、只增不减，保证重复重跑结果确定。
 
 ## 5. HTTP 查询接口
@@ -109,7 +131,8 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 | 路径 | 说明 |
 | --- | --- |
 | `GET /health` | 健康检查与当前快照信息 |
-| `GET /publications` | 当前发布清单 + 全部历史发布 id |
+| `GET /publications` | 当前发布清单 + 全部历史发布 id + 批次台账 |
+| `GET /batches` | 批次台账（有效 / 已撤销、文件与记录数） |
 | `GET /accounts?day=&connectionId=&vessel=&meterId=` | 日账查询，可跨日按条件过滤 |
 | `GET /quarantines?connectionId=` | 隔离区查询 |
 | `GET /lineage?docId=` | 按结果文档 id 查血缘 |
@@ -120,6 +143,7 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 ```bash
 curl -s "http://localhost:8080/accounts?day=2026-11-04"
 curl -s "http://localhost:8080/connection?id=CONN-106"
+curl -s "http://localhost:8080/batches"
 ```
 
 ## 6. 产物与血缘
@@ -127,15 +151,17 @@ curl -s "http://localhost:8080/connection?id=CONN-106"
 ```
 data/publications/
 ├── current.json                     # 指针 + 累积墓碑
-└── pub-full-20261118xxxxxx-xxxxxx/
+└── pub-revoke-20261118xxxxxx-xxxxxx/
     ├── daily-accounts.jsonl         # 日账（每日用量 Wh/kWh、边界读数、读数清单）
     ├── quarantines.jsonl            # 隔离结果（原因码、中文说明、证据）
     ├── lineage.jsonl                # 血缘（接电/读数出处、输入文件清单与哈希）
-    └── manifest.json                # 发布清单（模式、计数、撤下、告警、指纹）
+    ├── batches.jsonl                # 批次台账（状态、文件哈希、撤销时间）
+    ├── batch-records.jsonl          # 各有效批次的原始记录（投递文件清走后撤销仍可用）
+    └── manifest.json                # 发布清单（模式、计数、批次、撤下、告警、指纹）
 ```
 
-每条日账与隔离结果都有对应血缘文档，记录所依据的原始文件名、行号、记录 id、修订版本及
-文件 SHA-256，可完整追溯到原始记录及其修订版本。
+每条日账与隔离结果都有对应血缘文档，记录所依据的原始文件名、行号、记录 id、修订版本、
+所属批次及文件 SHA-256，可完整追溯到原始记录及其修订版本。
 
 ## 7. 目录结构
 
@@ -144,10 +170,11 @@ src/
   encoding.ts    GB18030 / UTF-8 解码
   time.ts        北京时间自然日、午夜、跨日枚举
   units.ts       Wh/kWh 归一化与等值比较
-  ingest.ts      双源扫描、哈希去重、修订合并、出处采集
+  ingest.ts      双源扫描、哈希去重、出处采集
+  batches.ts     可撤销来源批次：按剩余有效批次选最高修订、影响面判定
   settlement.ts  边界校验、隔离判定、按自然日拆账
-  storage.ts     不可变发布、原子指针、墓碑、幂等指纹
-  pipeline.ts    全量/重跑编排、血缘构建
+  storage.ts     不可变发布、原子指针、墓碑、批次台账、幂等指纹
+  pipeline.ts    首次导入/补发/重跑/撤销编排、血缘构建、投递文件清理
   server.ts      HTTP 快照查询接口
   cli.ts         命令行入口
 scripts/         夹具生成器与端到端演示
