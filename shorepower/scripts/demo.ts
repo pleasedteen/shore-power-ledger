@@ -111,6 +111,16 @@ async function main(): Promise<void> {
   );
   const second = await rerunDay(inputDir, dataDir, '2026-11-04');
   checkTrue('重跑产生新版本', !second.skipped);
+  // 分片读写范围：未涉及接电硬链接复用，只读写涉及接电的分片
+  checkTrue(
+    `重跑明细读取 ${second.detailIo.detailDocsRead} < 整版 ${second.detailDocCount}`,
+    second.detailIo.detailDocsRead < second.detailDocCount,
+  );
+  checkTrue(
+    `重跑明细写入 ${second.detailIo.detailDocsWritten} < 整版 ${second.detailDocCount}`,
+    second.detailIo.detailDocsWritten < second.detailDocCount,
+  );
+  checkTrue('未涉及接电以硬链接复用分片', second.detailIo.shardsLinked > 0);
   const pub2 = await loadCurrentPublication(dataDir);
   if (!pub2) throw new Error('重跑后读不到当前发布');
 
@@ -198,7 +208,7 @@ async function main(): Promise<void> {
 
   console.log('\n────────────── 演示小结 ──────────────');
   console.log(`工作目录（临时）：${work}`);
-  console.log('存储布局：data/publications/<pub-id>/{daily-accounts,quarantines,lineage}.jsonl + manifest.json');
+  console.log('存储布局（分片）：data/publications/<pub-id>/{index.json,manifest.json,accounts/<日>/,quarantine/,lineage/}');
   if (failures === 0) {
     console.log('全部检查通过 ✅');
   } else {

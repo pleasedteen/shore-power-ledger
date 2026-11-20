@@ -75,6 +75,12 @@ test('全量 -> 指定日重跑：纳入重叠接电、替换撤下、其余沿�
   const third = await rerunDay(input, data, '2026-11-04');
   assert.equal(third.skipped, true);
   assert.equal(third.publicationId, pub2.manifest.publicationId);
+
+  // 分片发布：每次重跑只读取/写入少量明细，未涉及接电以硬链接沿用
+  assert.equal(second.detailIo.detailDocsRead < second.detailDocCount, true);
+  assert.equal(second.detailIo.detailDocsWritten < second.detailDocCount, true);
+  assert.ok(second.detailIo.shardsLinked > 0, '未涉及接电的分片应硬链接复用');
+  assert.equal(third.detailIo.detailDocsWritten, 0, '幂等跳过不写任何明细');
 });
 
 test('全量输入视图（all-in-one）一次跑通，重送文件被识别', async () => {
@@ -86,6 +92,46 @@ test('全量输入视图（all-in-one）一次跑通，重送文件被识别', a
   assert.equal(out.quarantineCount, 3);
   const pub = (await loadCurrentPublication(data))!;
   assert.ok(pub.manifest.inputFiles.some((f) => f.duplicateOf !== undefined));
+});
+
+test('按天/按接电查询只读取相关分片，且快照不随发布切换而撕裂', async () => {
+  const { root, input, data } = await freshDirs();
+  after(() => rm(root, { recursive: true, force: true }));
+  await copyStage(run1, input);
+  const first = await runFull(input, data);
+
+  const measured: Array<{ path: string; read: number; total: number }> = [];
+  const handle = await startHttpServer(data, 0, {
+    onDetailIo: (snap, pathName) => measured.push({ path: pathName, read: snap.detailDocsRead, total: 0 }),
+  });
+  after(() => handle.close());
+  const base = `http://localhost:${handle.port}`;
+  const get = async (p: string) => (await (await fetch(`${base}${p}`)).json()) as any;
+
+  const pub1 = (await loadCurrentPublication(data))!;
+  const totalDetail = pub1.accounts.length + pub1.quarantines.length + pub1.lineage.length;
+
+  // 单日查询只读该日分片，远少于整版
+  const dayRows = await get('/accounts?day=2026-11-04');
+  assert.ok(dayRows.count > 0);
+  assert.ok(measured.at(-1)!.read < totalDetail, `按天读取 ${measured.at(-1)!.read}/${totalDetail}`);
+
+  // 单接电查询只读该接电分片
+  const oneConn = await get('/connection?id=CONN-101');
+  assert.ok(oneConn.accounts.length > 0);
+  assert.ok(measured.at(-1)!.read < totalDetail);
+
+  // 切换发布后，同一请求内仍只看到一个发布（指针只读一次）
+  await copyStage(run2, input);
+  await rerunDay(input, data, '2026-11-04');
+  const [health, switched] = await Promise.all([get('/health'), get('/accounts?day=2026-11-04')]);
+  assert.equal(switched.snapshot.publicationId, health.snapshot.publicationId);
+  assert.notEqual(health.snapshot.publicationId, first.publicationId);
+
+  // 旧发布 id 仍可精确回查
+  const old = await get(`/accounts?day=2026-11-04&publicationId=${first.publicationId}`);
+  assert.equal(old.snapshot.publicationId, first.publicationId);
+  assert.equal(old.count, 2); // 首版 11-04：CONN-101 / CONN-106
 });
 
 test('HTTP 接口返回同一发布快照，且可指定历史发布', async () => {

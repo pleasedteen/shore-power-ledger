@@ -23,9 +23,10 @@ npm run demo        # 端到端演示：生成夹具 → 发布 → 补发更正
 其它常用命令：
 
 ```bash
-npm test            # node:test 单元 + 集成测试（18 个用例）
+npm test            # node:test 单元 + 集成测试（22 个用例，含 90 天规模读写范围验证）
 npm run build       # TypeScript 类型检查并编译到 dist/
 npm run gen:fixtures  # 重新生成双源夹具到 fixtures/
+npm run gen:scale -- <目录> --days 90 --per-day 3   # 生成 90 天规模夹具（不提交）
 ```
 
 ## 2. 输入数据格式
@@ -126,13 +127,23 @@ curl -s "http://localhost:8080/connection?id=CONN-106"
 
 ```
 data/publications/
-├── current.json                     # 指针 + 累积墓碑
+├── current.json                          # 指针 + 累积墓碑
 └── pub-full-20261118xxxxxx-xxxxxx/
-    ├── daily-accounts.jsonl         # 日账（每日用量 Wh/kWh、边界读数、读数清单）
-    ├── quarantines.jsonl            # 隔离结果（原因码、中文说明、证据）
-    ├── lineage.jsonl                # 血缘（接电/读数出处、输入文件清单与哈希）
-    └── manifest.json                # 发布清单（模式、计数、撤下、告警、指纹）
+    ├── index.json                        # 发布索引：按日/按接电定位分片、分片哈希
+    ├── accounts/<日>/<接电>.jsonl        # 日账分片（每日用量 Wh/kWh、边界读数、读数清单）
+    ├── quarantine/<接电>.jsonl           # 隔离分片（原因码、中文说明、证据）
+    ├── lineage/<接电>.jsonl              # 血缘分片（接电/读数出处、输入文件清单与哈希）
+    └── manifest.json                     # 发布清单（模式、计数、撤下、告警、指纹）
 ```
+
+明细按「接电 × 自然日」切成分片，`index.json` 记录每个接电的窗口、文档 id 与分片哈希：
+
+- **按天查询**只读取该日的日账分片，按接电查询只读该接电的日账/隔离/血缘分片；
+- **指定日重跑**只读取索引确定纳入集合，重算涉及接电并写回其分片；未涉及的接电以
+  **硬链接**复用上一版分片，既不读取也不重写明细；
+- 指纹由索引（含全部分片哈希）计算，因此幂等判断无需读取明细；
+- 分片内不写 `publicationId`，读取时按发布注入，HTTP 响应与原整版发布逐字节一致；
+- 旧版整版发布目录（无 `index.json`）仍可查询；以其为当前发布重跑时会一次性迁移为分片。
 
 每条日账与隔离结果都有对应血缘文档，记录所依据的原始文件名、行号、记录 id、修订版本及
 文件 SHA-256，可完整追溯到原始记录及其修订版本。
@@ -146,7 +157,8 @@ src/
   units.ts       Wh/kWh 归一化与等值比较
   ingest.ts      双源扫描、哈希去重、修订合并、出处采集
   settlement.ts  边界校验、隔离判定、按自然日拆账
-  storage.ts     不可变发布、原子指针、墓碑、幂等指纹
+  storage.ts     不可变发布（分片 + 索引）、原子指针、墓碑、幂等指纹、旧版兼容读取
+  metrics.ts     明细读写计量（用于验证按天查询/重跑的读写范围）
   pipeline.ts    全量/重跑编排、血缘构建
   server.ts      HTTP 快照查询接口
   cli.ts         命令行入口

@@ -42,14 +42,17 @@ function printOutcome(out: RunOutcome): void {
   } else {
     console.log(`✅ 新发布完成：${out.publicationId}`);
   }
-  console.log(`   日账文档：${out.accountCount} 条；隔离文档：${out.quarantineCount} 条`);
-  console.log(`   重新结算接电：${out.recomputedConnectionIds.join(', ') || '（无）'}`);
+  console.log(`   日账文档：${out.accountCount} 条；隔离文档：${out.quarantineCount} 条`);  console.log(`   重新结算接电：${out.recomputedConnectionIds.join(', ') || '（无）'}`);
   console.log(`   沿用既有结果：${out.carriedConnectionIds.join(', ') || '（无）'}`);
   console.log(`   撤下失效文档：${out.withdrawnDocIds.join(', ') || '（无）'}`);
   if (out.warnings.length > 0) {
     console.log('   告警：');
     for (const w of out.warnings) console.log(`     - ${w}`);
   }
+  console.log(
+    `   明细读写：读 ${out.detailIo.detailDocsRead} 条 / 写 ${out.detailIo.detailDocsWritten} 条` +
+      `（硬链接复用分片 ${out.detailIo.shardsLinked} 个；整版明细 ${out.detailDocCount} 条）`,
+  );
 }
 
 async function main(): Promise<void> {
