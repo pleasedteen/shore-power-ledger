@@ -13,6 +13,7 @@
     "run": "tsx src/cli.ts run",
     "rerun": "tsx src/cli.ts rerun",
     "demo": "tsx scripts/demo.ts",
+    "repro:concurrent": "tsx scripts/repro-concurrent-rerun.ts",
     "gen:fixtures": "tsx scripts/generate-fixtures.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
