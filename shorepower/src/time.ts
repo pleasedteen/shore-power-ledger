@@ -77,3 +77,30 @@ export function overlapsDay(startMs: number, endMs: number, day: string): boolea
   const dayEnd = dayStart + 24 * 60 * 60 * 1000;
   return startMs < dayEnd && endMs > dayStart;
 }
+
+/** 判断接电区间与北京时间日期范围 [startDay, endDay]（含首尾）是否重叠 */
+export function overlapsDayRange(
+  startMs: number,
+  endMs: number,
+  startDay: string,
+  endDay: string,
+): boolean {
+  const rangeStart = beijingMidnightMs(startDay);
+  // 范围末日的次日午夜（即范围结束的开区间边界）
+  const rangeEnd = beijingMidnightMs(endDay) + 24 * 60 * 60 * 1000;
+  return startMs < rangeEnd && endMs > rangeStart;
+}
+
+/** 校验北京时间日期串 YYYY-MM-DD 且起不晚于止 */
+export function assertValidDayRange(startDay: string, endDay: string): void {
+  const re = /^\d{4}-\d{2}-\d{2}$/;
+  if (!re.test(startDay) || !re.test(endDay)) {
+    throw new Error('日期必须为 YYYY-MM-DD（北京时间自然日）');
+  }
+  if (Number.isNaN(beijingMidnightMs(startDay)) || Number.isNaN(beijingMidnightMs(endDay))) {
+    throw new Error('日期无法解析为北京时间自然日');
+  }
+  if (startDay > endDay) {
+    throw new Error(`日期范围非法：起始日 ${startDay} 晚于结束日 ${endDay}`);
+  }
+}

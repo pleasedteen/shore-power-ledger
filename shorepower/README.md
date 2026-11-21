@@ -23,7 +23,7 @@ npm run demo        # 端到端演示：生成夹具 → 发布 → 补发更正
 其它常用命令：
 
 ```bash
-npm test            # node:test 单元 + 集成测试（18 个用例）
+npm test            # node:test 单元 + 集成测试（23 个用例，含回补中断/续跑）
 npm run build       # TypeScript 类型检查并编译到 dist/
 npm run gen:fixtures  # 重新生成双源夹具到 fixtures/
 ```
@@ -79,6 +79,10 @@ npx tsx src/cli.ts run --input ./input --data ./data
 # 指定北京时间自然日重跑
 npx tsx src/cli.ts rerun --day 2026-11-04 --input ./input --data ./data
 
+# 按北京时间日期范围（含首尾）历史回补，整批一次发布；中断后重跑同一范围即续跑
+npx tsx src/cli.ts rerun-range --start 2026-11-03 --end 2026-11-04 \
+  --input ./input --data ./data
+
 # 启动查询服务
 npx tsx src/cli.ts serve --data ./data --port 8080
 ```
@@ -92,6 +96,25 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 
 对纳入接电重新结算，在其**所有相关日期**替换日账/隔离/血缘；未纳入接电沿用各自已发布结果。
 上一版中被新结果取代或已从输入消失的文档进入持久墓碑（`withdrawnDocIds`）并被撤下。
+
+### 历史回补语义（按日期范围一次发布）
+
+`rerun-range --start D1 --end D2` 把一段时间的历史数据合并为**一次发布**：
+
+- **整笔跨日接电**：启动时取「最新输入窗口 ∪ 上一版发布窗口」与 `[D1, D2]` 重叠的接电，
+  整笔纳入结算，绝不按天切碎；未纳入接电沿用上一完整发布的结果；
+- **提交前只可见上一完整发布**：回补暂存写在与 `publications/` 隔离的 `backfills/` 目录，
+  整批原子提交前，当前查询与历史列表都只能看到上一完整发布，看不到任何半成品；
+  提交后整批结果在**同一发布号** `pub-backfill-<起>-<止>` 下可查；
+- **断点续跑**：每完成一笔接电就原子落盘并更新作业状态。进程中断后以同一日期范围再次
+  启动即续跑——**即使输入投递目录已整体更换**，已持久化的接电从暂存读回、绝不重算；
+- **确定发布号、无重复版本**：发布号由日期范围确定性派生，续跑与成功后的重试都返回
+  原发布号；历史发布列表只承认含 `manifest.json` 的完整目录，不出现幽灵/重复版本；
+- **暂存量只随纳入接电笔数增长**：每笔接电一个暂存文件（结算文档 + 读数出处 + 输入文件
+  元数据），不复制读数明细；输入中无关读数增至十倍，续跑暂存也不会翻倍。
+
+中断注入（测试/演练用）：设置 `BACKFILL_CRASH_AFTER=N`，回补暂存完第 N 笔接电后
+进程以退出码 2 终止，再次执行同一命令即可观察续跑。
 
 ### 发布的可靠性与幂等
 
@@ -125,13 +148,18 @@ curl -s "http://localhost:8080/connection?id=CONN-106"
 ## 6. 产物与血缘
 
 ```
-data/publications/
-├── current.json                     # 指针 + 累积墓碑
-└── pub-full-20261118xxxxxx-xxxxxx/
-    ├── daily-accounts.jsonl         # 日账（每日用量 Wh/kWh、边界读数、读数清单）
-    ├── quarantines.jsonl            # 隔离结果（原因码、中文说明、证据）
-    ├── lineage.jsonl                # 血缘（接电/读数出处、输入文件清单与哈希）
-    └── manifest.json                # 发布清单（模式、计数、撤下、告警、指纹）
+data/
+├── publications/
+│   ├── current.json                     # 指针 + 累积墓碑
+│   └── pub-full-20261118xxxxxx-xxxxxx/
+│       ├── daily-accounts.jsonl         # 日账（每日用量 Wh/kWh、边界读数、读数清单）
+│       ├── quarantines.jsonl            # 隔离结果（原因码、中文说明、证据）
+│       ├── lineage.jsonl                # 血缘（接电/读数出处、输入文件清单与哈希）
+│       └── manifest.json                # 发布清单（模式、计数、撤下、告警、指纹）
+└── backfills/                           # 历史回补作业暂存（与发布目录隔离，查询不可见）
+    └── <起始日>_<结束日>/
+        ├── job.json                     # 作业状态：发布号、基准发布、已完成接电（原子更新）
+        └── staging/<connectionId>.json  # 逐接电结算暂存，一笔一个文件，支撑断点续跑
 ```
 
 每条日账与隔离结果都有对应血缘文档，记录所依据的原始文件名、行号、记录 id、修订版本及
@@ -141,16 +169,17 @@ data/publications/
 
 ```
 src/
-  encoding.ts    GB18030 / UTF-8 解码
-  time.ts        北京时间自然日、午夜、跨日枚举
-  units.ts       Wh/kWh 归一化与等值比较
-  ingest.ts      双源扫描、哈希去重、修订合并、出处采集
-  settlement.ts  边界校验、隔离判定、按自然日拆账
-  storage.ts     不可变发布、原子指针、墓碑、幂等指纹
-  pipeline.ts    全量/重跑编排、血缘构建
-  server.ts      HTTP 快照查询接口
-  cli.ts         命令行入口
-scripts/         夹具生成器与端到端演示
-test/            node:test 测试
-fixtures/        双源夹具（run1 / run2 / all-in-one）
+  encoding.ts       GB18030 / UTF-8 解码
+  time.ts           北京时间自然日、午夜、跨日枚举、日期范围重叠判断
+  units.ts          Wh/kWh 归一化与等值比较
+  ingest.ts         双源扫描、哈希去重、修订合并、出处采集
+  settlement.ts     边界校验、隔离判定、按自然日拆账
+  storage.ts        不可变发布、原子指针、墓碑、幂等指纹、可续跑提交
+  backfill-store.ts 回补作业状态与逐接电暂存（断点续跑、确定性发布号）
+  pipeline.ts       全量/重跑/日期范围回补编排、血缘构建
+  server.ts         HTTP 快照查询接口
+  cli.ts            命令行入口
+scripts/            夹具生成器与端到端演示
+test/               node:test 测试
+fixtures/           双源夹具（run1 / run2 / all-in-one）
 ```

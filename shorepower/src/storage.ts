@@ -127,17 +127,33 @@ export async function loadPublication(
 }
 
 export async function listPublicationIds(dataDir: string): Promise<string[]> {
+  let entries: string[];
   try {
-    const entries = await readdir(publicationsRoot(dataDir));
-    return entries.filter((e) => e.startsWith('pub-')).sort();
+    entries = await readdir(publicationsRoot(dataDir));
   } catch {
     return [];
   }
+  // 只承认含 manifest.json 的目录：任何临时/半成品目录（含 .tmp- 暂存）都不会
+  // 出现在历史发布清单里，避免“历史列表新增重复版本/幽灵版本”。
+  const ids: string[] = [];
+  for (const e of entries) {
+    if (!e.startsWith('pub-')) continue;
+    try {
+      await readFile(path.join(publicationsRoot(dataDir), e, 'manifest.json'));
+      ids.push(e);
+    } catch {
+      // 无清单的目录（残留暂存等）不计入历史发布
+    }
+  }
+  return ids.sort();
 }
 
 /**
  * 原子发布：先写临时目录，全部文件落盘后 rename 为正式目录，再切换指针。
  * 任一步失败/进程退出，current.json 都保持指向上一完整发布。
+ *
+ * 可续跑：若正式目录已存在（上一轮在 rename 之后、切换指针之前中断），
+ * 校验其清单指纹与本次一致后直接复用该目录、只补切指针，绝不产生重复发布。
  *
  * @param tombstoneDocIds 截至本次发布的全部撤下文档 id（历史墓碑 + 本次新增）
  */
@@ -145,22 +161,41 @@ export async function commitPublication(
   dataDir: string,
   bundle: PublicationBundle,
   tombstoneDocIds: string[],
-): Promise<{ publicationId: string; skipped: false }> {
+): Promise<{ publicationId: string; skipped: false; reusedDirectory: boolean }> {
   const root = publicationsRoot(dataDir);
   await mkdir(root, { recursive: true });
   const publicationId = bundle.manifest.publicationId;
-  const tmpDir = path.join(root, `${publicationId}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
   const finalDir = path.join(root, publicationId);
-  await mkdir(tmpDir, { recursive: true });
 
-  await Promise.all([
-    writeFile(path.join(tmpDir, 'daily-accounts.jsonl'), toJsonl(bundle.accounts)),
-    writeFile(path.join(tmpDir, 'quarantines.jsonl'), toJsonl(bundle.quarantines)),
-    writeFile(path.join(tmpDir, 'lineage.jsonl'), toJsonl(bundle.lineage)),
-    writeFile(path.join(tmpDir, 'manifest.json'), JSON.stringify(bundle.manifest, null, 2) + '\n'),
-  ]);
+  let reusedDirectory = false;
+  try {
+    const existingRaw = await readFile(path.join(finalDir, 'manifest.json'), 'utf-8');
+    const existing = JSON.parse(existingRaw) as PublicationManifest;
+    if (existing.fingerprint !== bundle.manifest.fingerprint) {
+      throw new Error(
+        `发布目录 ${publicationId} 已存在但内容指纹不一致，拒绝覆盖以保证不可变性`,
+      );
+    }
+    // 同一发布号、同一指纹：上一轮在切指针前中断，目录可直接复用
+    reusedDirectory = true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    const tmpDir = path.join(
+      root,
+      `${publicationId}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`,
+    );
+    await mkdir(tmpDir, { recursive: true });
 
-  await rename(tmpDir, finalDir);
+    await Promise.all([
+      writeFile(path.join(tmpDir, 'daily-accounts.jsonl'), toJsonl(bundle.accounts)),
+      writeFile(path.join(tmpDir, 'quarantines.jsonl'), toJsonl(bundle.quarantines)),
+      writeFile(path.join(tmpDir, 'lineage.jsonl'), toJsonl(bundle.lineage)),
+      writeFile(path.join(tmpDir, 'manifest.json'), JSON.stringify(bundle.manifest, null, 2) + '\n'),
+    ]);
+
+    await rename(tmpDir, finalDir);
+  }
+
   // 指针写入同目录临时文件后原子替换；墓碑随指针一并持久化
   const pointerTmp = path.join(root, `${CURRENT_POINTER}.tmp-${process.pid}`);
   const pointer: CurrentPointer = {
@@ -169,7 +204,7 @@ export async function commitPublication(
   };
   await writeFile(pointerTmp, JSON.stringify(pointer, null, 2) + '\n');
   await rename(pointerTmp, pointerPath(dataDir));
-  return { publicationId, skipped: false };
+  return { publicationId, skipped: false, reusedDirectory };
 }
 
 /**

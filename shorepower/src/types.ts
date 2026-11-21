@@ -154,10 +154,13 @@ export interface PublicationManifest {
   docType: 'manifest';
   publicationId: string;
   createdAtMs: number;
-  /** full：全量发布；rerun：指定日期重跑 */
-  mode: 'full' | 'rerun';
+  /** full：全量发布；rerun：指定日期重跑；backfill：按北京时间日期范围历史回补 */
+  mode: 'full' | 'rerun' | 'backfill';
   /** rerun 时运营人员指定的北京时间日期 */
   rerunDay?: string;
+  /** backfill 时运营人员指定的北京时间日期范围（含首尾） */
+  backfillStartDay?: string;
+  backfillEndDay?: string;
   inputFiles: InputFileInfo[];
   accountCount: number;
   quarantineCount: number;

@@ -95,6 +95,8 @@ export async function startHttpServer(dataDir: string, requestedPort: number): P
         createdAt: new Date(bundle.manifest.createdAtMs).toISOString(),
         mode: bundle.manifest.mode,
         rerunDay: bundle.manifest.rerunDay ?? null,
+        backfillStartDay: bundle.manifest.backfillStartDay ?? null,
+        backfillEndDay: bundle.manifest.backfillEndDay ?? null,
       };
 
       switch (url.pathname) {
