@@ -40,6 +40,8 @@ export interface ConnectionRecord {
   startBeijingMs: number;
   /** 接电结束时刻，北京时间（UTC+8）对应的绝对时间 ms */
   endBeijingMs: number;
+  /** 最高修订组内存在多份内容不一致的同修订来源，无法裁决权威版本 */
+  revisionConflict?: boolean;
   sources: SourceRef[];
 }
 
@@ -57,6 +59,8 @@ export interface MeterReading {
   originalUnit: 'Wh' | 'kWh';
   /** 原始数值（字符串保留原始写法） */
   originalValue: string;
+  /** 最高修订组内存在多份内容不一致的同修订来源，无法裁决权威版本 */
+  revisionConflict?: boolean;
   sources: SourceRef[];
 }
 
@@ -123,12 +127,13 @@ export interface QuarantineEntry {
   reasons: QuarantineReason[];
   /** 人类可读的中文说明 */
   messages: string[];
-  /** 触发问题时涉及的读数出处 */
+  /** 触发问题时涉及的记录出处；同修订冲突保留各方来源 */
   evidence: Array<{
     sampledAtMs?: number;
     cumulativeWh?: number;
     note: string;
     source?: SourceRef;
+    sources?: SourceRef[];
   }>;
 }
 

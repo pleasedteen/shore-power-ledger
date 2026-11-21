@@ -64,7 +64,8 @@ function groupByTimestamp(
       conflictEvidence.push({
         sampledAtMs: r.sampledAtMs,
         note: `同一采样时刻存在不一致累计读数：${exist.cumulativeWh} Wh vs ${r.cumulativeWh} Wh`,
-        source: r.sources[0],
+        // 保留该时刻全部各方读数的出处，而非只留触发者
+        sources: [...exist.readings.map((x) => x.sources[0]!), r.sources[0]!],
       });
     }
   }
@@ -81,8 +82,24 @@ export function settleConnection(
   const messages: string[] = [];
   const evidence: QuarantineEntry['evidence'] = [];
 
-  // 1. 窗口合法性（早退，不依赖后续变量）
+  /** 接电自身的同修订冲突：整笔隔离，证据保留各方出处 */
+  const noteConnectionConflict = (): void => {
+    if (!conn.revisionConflict || reasons.includes('SOURCE_REVISION_CONFLICT')) return;
+    reasons.push('SOURCE_REVISION_CONFLICT');
+    messages.push('同一接电记录的相同修订版本存在内容冲突，无法确定权威版本');
+    evidence.push({
+      note: `接电记录 ${conn.connectionId} rev=${conn.revision} 同修订内容冲突，保留各方出处`,
+      sources: [...conn.sources],
+    });
+  };
+
+  // 1. 窗口合法性（早退，但同修订冲突原因仍要随整笔隔离一并保留）
   if (!(conn.endBeijingMs > conn.startBeijingMs)) {
+    noteConnectionConflict();
+    const allReasons = [...new Set<QuarantineReason>([
+      'INVALID_CONNECTION_WINDOW',
+      ...reasons,
+    ])];
     return {
       connection: conn,
       accounts: [],
@@ -96,14 +113,17 @@ export function settleConnection(
         meterId: conn.meterId,
         startBeijingMs: conn.startBeijingMs,
         endBeijingMs: conn.endBeijingMs,
-        reasons: ['INVALID_CONNECTION_WINDOW'],
+        reasons: allReasons,
         messages: [
           `接电起止时间非法：结束时间(${conn.endBeijingMs})必须晚于起始时间(${conn.startBeijingMs})`,
+          ...messages,
         ],
-        evidence: [],
+        evidence,
       },
     };
   }
+
+  noteConnectionConflict();
 
   const quarantine = (): ConnectionSettlement => ({
     connection: conn,
@@ -142,6 +162,22 @@ export function settleConnection(
     reasons.push('CONFLICTING_READING');
     messages.push('接电期间同一采样时刻存在互相冲突的累计读数');
     evidence.push(...conflictEvidence);
+  }
+
+  // 2.1 读数自身的同修订冲突：只有候选位置（电表+采样时刻）落在本接电窗口内才会命中，
+  //     因此只影响命中候选位置的接电；整笔隔离，证据保留各方出处。
+  const conflictingReadings = inWindow.filter((r) => r.revisionConflict);
+  if (conflictingReadings.length > 0) {
+    reasons.push('SOURCE_REVISION_CONFLICT');
+    messages.push('接电期间存在相同修订版本内容冲突的电表读数，无法确定权威版本');
+    for (const r of conflictingReadings) {
+      evidence.push({
+        sampledAtMs: r.sampledAtMs,
+        cumulativeWh: r.cumulativeWh,
+        note: `读数记录 ${r.readingId} rev=${r.revision} 同修订内容冲突，候选位置之一落在本接电窗口，保留各方出处`,
+        sources: [...r.sources],
+      });
+    }
   }
 
   // 3. 累计电量回退（按时刻升序必须单调不减）

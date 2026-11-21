@@ -13,7 +13,8 @@
     "run": "tsx src/cli.ts run",
     "rerun": "tsx src/cli.ts rerun",
     "demo": "tsx scripts/demo.ts",
-    "gen:fixtures": "tsx scripts/generate-fixtures.ts",
+    "gen:fixtures": "tsx scripts/generate-fixtures.ts && tsx scripts/generate-conflict-fixtures.ts",
+    "gen:conflict-fixtures": "tsx scripts/generate-conflict-fixtures.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {

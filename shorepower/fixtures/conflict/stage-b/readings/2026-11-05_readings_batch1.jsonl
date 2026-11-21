@@ -1,0 +1,8 @@
+{"reading_id":"R801","revision":1,"meter_id":"M8","sampled_at_utc":"2026-11-09T00:00:00Z","unit":"kWh","cumulative":"1.0"}
+{"reading_id":"R802","revision":1,"meter_id":"M8","sampled_at_utc":"2026-11-09T16:00:00Z","unit":"Wh","cumulative":"20000"}
+{"reading_id":"R803","revision":1,"meter_id":"M8","sampled_at_utc":"2026-11-10T00:00:00Z","unit":"Wh","cumulative":"26000"}
+{"reading_id":"R804","revision":1,"meter_id":"M8","sampled_at_utc":"2026-11-09T04:00:00Z","unit":"Wh","cumulative":"15500"}
+{"reading_id":"R901","revision":1,"meter_id":"M9","sampled_at_utc":"2026-11-09T01:00:00Z","unit":"Wh","cumulative":"200"}
+{"reading_id":"R902","revision":1,"meter_id":"M9","sampled_at_utc":"2026-11-09T09:00:00Z","unit":"Wh","cumulative":"8200"}
+{"reading_id":"R1001","revision":1,"meter_id":"M10","sampled_at_utc":"2026-11-10T00:00:00Z","unit":"Wh","cumulative":"0"}
+{"reading_id":"R1002","revision":1,"meter_id":"M10","sampled_at_utc":"2026-11-10T10:00:00Z","unit":"Wh","cumulative":"6000"}

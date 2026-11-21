@@ -179,76 +179,147 @@ function parseReadingJsonl(
 }
 
 /**
- * 合并同主键记录：最高 revision 为准。
- * 同 revision 重复出现时，内容一致则合并出处，不一致则保留先到者并告警。
+ * 合并同主键接电记录：只按最高 revision 判定，与文件到达顺序无关。
+ * - 低修订一律不参与裁决，即使它们彼此冲突也不会触发隔离（已被高修订覆盖）；
+ * - 最高修订组内内容一致（等值）的多份来源合并出处；
+ * - 最高修订组内内容不一致：整笔标记 revisionConflict，保留各方出处，
+ *   由结算层将整次接电隔离（SOURCE_REVISION_CONFLICT）。
  */
 function mergeConnections(
   raws: RawConnection[],
   warnings: string[],
 ): ConnectionRecord[] {
-  const map = new Map<string, ConnectionRecord>();
+  const groups = new Map<string, RawConnection[]>();
   for (const r of raws) {
-    const exist = map.get(r.connectionId);
-    if (!exist || r.revision > exist.revision) {
-      map.set(r.connectionId, {
-        connectionId: r.connectionId,
-        revision: r.revision,
-        vessel: r.vessel,
-        meterId: r.meterId,
-        startBeijingMs: r.startBeijingMs,
-        endBeijingMs: r.endBeijingMs,
-        sources: [r.source],
-      });
-    } else if (r.revision === exist.revision) {
-      const same =
-        exist.vessel === r.vessel &&
-        exist.meterId === r.meterId &&
-        exist.startBeijingMs === r.startBeijingMs &&
-        exist.endBeijingMs === r.endBeijingMs;
-      if (same) {
-        exist.sources.push(r.source);
-      } else {
-        warnings.push(
-          `接电记录 ${r.connectionId} rev=${r.revision} 在 ${r.source.file}:${r.source.line} 与先前内容冲突，保留先到记录`,
-        );
-      }
-    }
+    const list = groups.get(r.connectionId);
+    if (list) list.push(r);
+    else groups.set(r.connectionId, [r]);
   }
-  return [...map.values()].sort((a, b) => a.connectionId.localeCompare(b.connectionId));
+
+  const out: ConnectionRecord[] = [];
+  for (const [connectionId, rows] of groups) {
+    const maxRevision = rows.reduce((m, r) => Math.max(m, r.revision), -Infinity);
+    const top = rows.filter((r) => r.revision === maxRevision);
+
+    // 按业务内容聚类：内容一致的来源归为同一候选
+    const buckets: RawConnection[][] = [];
+    for (const r of top) {
+      const bucket = buckets.find(
+        (b) =>
+          b[0]!.vessel === r.vessel &&
+          b[0]!.meterId === r.meterId &&
+          b[0]!.startBeijingMs === r.startBeijingMs &&
+          b[0]!.endBeijingMs === r.endBeijingMs,
+      );
+      if (bucket) bucket.push(r);
+      else buckets.push([r]);
+    }
+
+    const conflict = buckets.length > 1;
+    if (conflict) {
+      const origins = top
+        .map((r) => `${r.source.file}:${r.source.line}`)
+        .sort()
+        .join('、');
+      warnings.push(
+        `接电记录 ${connectionId} rev=${maxRevision} 存在 ${buckets.length} 份内容冲突的同修订来源（${origins}），无法确定权威版本，整次接电隔离`,
+      );
+    }
+
+    // 代表记录按（文件、行号）确定选取，保证任何文件顺序下结果一致
+    const representative = [...top].sort((a, b) =>
+      a.source.file === b.source.file
+        ? a.source.line - b.source.line
+        : a.source.file.localeCompare(b.source.file),
+    )[0]!;
+    out.push({
+      connectionId,
+      revision: maxRevision,
+      vessel: representative.vessel,
+      meterId: representative.meterId,
+      startBeijingMs: representative.startBeijingMs,
+      endBeijingMs: representative.endBeijingMs,
+      revisionConflict: conflict || undefined,
+      sources: top.map((r) => r.source),
+    });
+  }
+
+  return out.sort((a, b) => a.connectionId.localeCompare(b.connectionId));
 }
 
+/**
+ * 合并同主键读数记录：只按最高 revision 判定，与文件到达顺序无关。
+ * - 低修订一律不参与裁决；
+ * - 最高修订组内按（电表、采样时刻、累计电量）聚类：
+ *   同位置等值的多份来源合并出处（含不同单位的等值读数）；
+ *   出现不同位置/不同累计值即整笔标记 revisionConflict，
+ *   每个候选位置各产出一条读数并都带上最高修订组的各方出处；
+ * - 冲突读数只可能被引用其（meterId, 采样时刻）的接电命中，
+ *   因此只影响命中候选位置的接电，而不会波及同表其他接电。
+ */
 function mergeReadings(raws: RawReading[], warnings: string[]): MeterReading[] {
-  const map = new Map<string, MeterReading>();
+  const groups = new Map<string, RawReading[]>();
   for (const r of raws) {
-    const exist = map.get(r.readingId);
-    if (!exist || r.revision > exist.revision) {
-      map.set(r.readingId, {
-        readingId: r.readingId,
-        revision: r.revision,
-        meterId: r.meterId,
-        sampledAtMs: r.sampledAtMs,
-        cumulativeWh: r.cumulativeWh,
-        originalUnit: r.originalUnit,
-        originalValue: r.originalValue,
-        sources: [r.source],
+    const list = groups.get(r.readingId);
+    if (list) list.push(r);
+    else groups.set(r.readingId, [r]);
+  }
+
+  const out: MeterReading[] = [];
+  for (const [readingId, rows] of groups) {
+    const maxRevision = rows.reduce((m, r) => Math.max(m, r.revision), -Infinity);
+    const top = rows.filter((r) => r.revision === maxRevision);
+
+    // 按候选位置（电表 + 采样时刻 + 归一化累计值）聚类
+    const buckets: RawReading[][] = [];
+    for (const r of top) {
+      const bucket = buckets.find(
+        (b) =>
+          b[0]!.meterId === r.meterId &&
+          b[0]!.sampledAtMs === r.sampledAtMs &&
+          Math.abs(b[0]!.cumulativeWh - r.cumulativeWh) <= 1e-6,
+      );
+      if (bucket) bucket.push(r);
+      else buckets.push([r]);
+    }
+
+    const conflict = buckets.length > 1;
+    if (conflict) {
+      const origins = top
+        .map((r) => `${r.source.file}:${r.source.line}`)
+        .sort()
+        .join('、');
+      warnings.push(
+        `读数记录 ${readingId} rev=${maxRevision} 存在 ${buckets.length} 份内容冲突的同修订来源（${origins}），无法确定权威版本，命中候选位置的接电整笔隔离`,
+      );
+    }
+
+    // 每个候选位置一条读数；出处保留最高修订组的全部各方来源
+    for (const bucket of buckets) {
+      const representative = [...bucket].sort((a, b) =>
+        a.source.file === b.source.file
+          ? a.source.line - b.source.line
+          : a.source.file.localeCompare(b.source.file),
+      )[0]!;
+      out.push({
+        readingId,
+        revision: maxRevision,
+        meterId: representative.meterId,
+        sampledAtMs: representative.sampledAtMs,
+        cumulativeWh: representative.cumulativeWh,
+        originalUnit: representative.originalUnit,
+        originalValue: representative.originalValue,
+        revisionConflict: conflict || undefined,
+        sources: top.map((r) => r.source),
       });
-    } else if (r.revision === exist.revision) {
-      const same =
-        exist.meterId === r.meterId &&
-        exist.sampledAtMs === r.sampledAtMs &&
-        Math.abs(exist.cumulativeWh - r.cumulativeWh) <= 1e-6;
-      if (same) {
-        exist.sources.push(r.source);
-      } else {
-        warnings.push(
-          `读数记录 ${r.readingId} rev=${r.revision} 在 ${r.source.file}:${r.source.line} 与先前内容冲突，保留先到记录`,
-        );
-      }
     }
   }
-  return [...map.values()].sort((a, b) =>
+
+  return out.sort((a, b) =>
     a.meterId === b.meterId
-      ? a.sampledAtMs - b.sampledAtMs
+      ? a.sampledAtMs === b.sampledAtMs
+        ? a.readingId.localeCompare(b.readingId)
+        : a.sampledAtMs - b.sampledAtMs
       : a.meterId.localeCompare(b.meterId),
   );
 }

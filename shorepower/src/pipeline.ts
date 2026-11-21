@@ -17,7 +17,7 @@ import {
   loadTombstones,
   type PublicationBundle,
 } from './storage.js';
-import { overlapsDay } from './time.js';
+import { enumerateBeijingDays, overlapsDay } from './time.js';
 import type {
   ConnectionRecord,
   DailyAccount,
@@ -92,8 +92,6 @@ function recompute(
   readings: import('./types.js').MeterReading[],
   inputFiles: InputFileInfo[],
   publicationId: string,
-  revisionConflictIds: Set<string>,
-  warnings: string[],
 ): Recomputed {
   const out: Recomputed = { accounts: [], quarantines: [], lineage: [], connectionIds: [] };
 
@@ -101,36 +99,9 @@ function recompute(
     out.connectionIds.push(conn.connectionId);
     const settled = settleConnection(conn, readings);
 
-    if (revisionConflictIds.has(conn.connectionId)) {
-      // 同主键同修订内容冲突：整次接电隔离（若结算本身也隔离，合并原因）
-      const q: QuarantineEntry = settled.quarantine
-        ? { ...settled.quarantine, publicationId }
-        : {
-            docType: 'quarantine',
-            docId: `QUAR-${conn.connectionId}`,
-            publicationId,
-            connectionId: conn.connectionId,
-            revision: conn.revision,
-            vessel: conn.vessel,
-            meterId: conn.meterId,
-            startBeijingMs: conn.startBeijingMs,
-            endBeijingMs: conn.endBeijingMs,
-            reasons: [],
-            messages: [],
-            evidence: [],
-          };
-      if (!q.reasons.includes('SOURCE_REVISION_CONFLICT')) {
-        q.reasons = [...q.reasons, 'SOURCE_REVISION_CONFLICT'];
-        q.messages.push('同一来源记录的相同修订版本存在内容冲突，无法确定权威版本');
-      }
-      out.quarantines.push(q);
-      out.lineage.push(
-        buildLineage(publicationId, q.docId, 'quarantine', conn, settled.readingSources, inputFiles),
-      );
-      continue;
-    }
-
     if (settled.quarantine) {
+      // 同修订冲突（接电/读数）已由结算层并入同一条隔离文档：
+      // 每个接电每版发布至多一条隔离，原因与各方出处合并保留
       const q: QuarantineEntry = { ...settled.quarantine, publicationId };
       out.quarantines.push(q);
       out.lineage.push(
@@ -148,22 +119,8 @@ function recompute(
     }
   }
 
-  // 未消费的告警仍写入清单，保证可追溯
-  void warnings;
   out.connectionIds.sort();
   return out;
-}
-
-/** 从告警中提取“同修订冲突”的接电/读数主键 */
-function extractRevisionConflictIds(warnings: string[]): {
-  connectionIds: Set<string>;
-} {
-  const connectionIds = new Set<string>();
-  for (const w of warnings) {
-    const m = w.match(/接电记录\s+(\S+)\s+rev=/);
-    if (m) connectionIds.add(m[1]!);
-  }
-  return { connectionIds };
 }
 
 async function publish(
@@ -258,9 +215,8 @@ export async function runFull(inputDir: string, dataDir: string): Promise<RunOut
     loadCurrentPublication(dataDir),
     loadTombstones(dataDir),
   ]);
-  const { connectionIds } = extractRevisionConflictIds(warnings);
 
-  const recomputed = recompute(connections, readings, files, '__pending__', connectionIds, warnings);
+  const recomputed = recompute(connections, readings, files, '__pending__');
 
   // 全量替换：上一版存在、但本次发布不再保留的文档即被撤下；与历史墓碑合并累积
   const retainedDocIds = new Set<string>([
@@ -306,35 +262,50 @@ export async function rerunDay(
     return runFull(inputDir, dataDir);
   }
 
-  const { connectionIds } = extractRevisionConflictIds(warnings);
   const latestById = new Map(connections.map((c) => [c.connectionId, c]));
 
-  // 纳入集合：最新接电时段与该日重叠，或上一版发布接电时段与该日重叠
+  // 上一版每个接电“实际涉及的旧日”集合：
+  // 日账按各文档的自然日收集；隔离文档按其接电窗口覆盖的自然日收集。
+  // 只按实际落点的日子判定，候选位置之间的空档不会被当作重叠。
+  const previousDaysById = new Map<string, Set<string>>();
+  const addDay = (id: string, day: string): void => {
+    const set = previousDaysById.get(id);
+    if (set) set.add(day);
+    else previousDaysById.set(id, new Set([day]));
+  };
+  for (const a of previous.accounts) addDay(a.connectionId, a.beijingDay);
+  for (const q of previous.quarantines) {
+    for (const day of enumerateBeijingDays(q.startBeijingMs, q.endBeijingMs)) {
+      addDay(q.connectionId, day);
+    }
+  }
+
+  // 纳入集合（只按“候选实际涉及的旧日”判定，与文件顺序无关）：
+  // 1. 最新接电窗口与重跑日重叠；或
+  // 2. 上一版发布中该接电实际涉及重跑日（含旧原件已从输入移走的接电——
+  //    按任一候选实际涉及的旧日重跑，也要撤换整笔旧结果）。
   const includedIds = new Set<string>();
   for (const c of connections) {
     if (overlapsDay(c.startBeijingMs, c.endBeijingMs, day)) includedIds.add(c.connectionId);
   }
-  const previousConnWindows = new Map<string, { start: number; end: number }>();
-  for (const q of previous.quarantines) {
-    previousConnWindows.set(q.connectionId, { start: q.startBeijingMs, end: q.endBeijingMs });
+  for (const [id, days] of previousDaysById) {
+    if (days.has(day)) includedIds.add(id);
   }
-  for (const a of previous.accounts) {
-    if (!previousConnWindows.has(a.connectionId)) {
-      // 从日账窗口拼不出完整区间时，用窗口并集近似（仅用于重叠判断）
-      previousConnWindows.set(a.connectionId, {
-        start: Math.min(a.windowStartMs),
-        end: Math.max(a.windowEndMs),
-      });
-    } else {
-      const w = previousConnWindows.get(a.connectionId)!;
-      previousConnWindows.set(a.connectionId, {
-        start: Math.min(w.start, a.windowStartMs),
-        end: Math.max(w.end, a.windowEndMs),
-      });
-    }
-  }
-  for (const [id, w] of previousConnWindows) {
-    if (overlapsDay(w.start, w.end, day)) includedIds.add(id);
+
+  if (includedIds.size === 0) {
+    // 重跑日没有命中任何最新窗口或上一版实际涉及的旧日（候选之间的空档不算重叠）：
+    // 没有任何结果需要重算或撤换，直接跳过，指针与墓碑保持不动。
+    return {
+      publicationId: previous.manifest.publicationId,
+      skipped: true,
+      reason: `重跑日 ${day} 不涉及任何接电候选或已发布结果，无需重跑`,
+      accountCount: previous.manifest.accountCount,
+      quarantineCount: previous.manifest.quarantineCount,
+      recomputedConnectionIds: [],
+      carriedConnectionIds: previous.manifest.carriedConnectionIds,
+      withdrawnDocIds: historyTombstones,
+      warnings,
+    };
   }
 
   const includedConnections: ConnectionRecord[] = [];
@@ -342,17 +313,10 @@ export async function rerunDay(
   for (const id of includedIds) {
     const latest = latestById.get(id);
     if (latest) includedConnections.push(latest);
-    else missingIncluded.push(id); // 最新输入已无此接电：其旧结果将被撤下
+    else missingIncluded.push(id); // 最新输入已无此接电：其旧结果将被整笔撤下
   }
 
-  const recomputed = recompute(
-    includedConnections,
-    readings,
-    files,
-    '__pending__',
-    connectionIds,
-    warnings,
-  );
+  const recomputed = recompute(includedConnections, readings, files, '__pending__');
 
   // 沿用：上一版中不属于纳入集合的文档原样复制
   const carriedAccounts = previous.accounts.filter((a) => !includedIds.has(a.connectionId));
@@ -378,7 +342,7 @@ export async function rerunDay(
 
   if (missingIncluded.length > 0) {
     warnings.push(
-      `以下接电在上一版发布中与 ${day} 重叠，但最新输入已不存在，旧结果已撤下：${missingIncluded.join(', ')}`,
+      `以下接电的旧结果实际涉及重跑日 ${day}，但最新输入已不存在该接电，旧结果已整笔撤下：${missingIncluded.join(', ')}`,
     );
   }
 
