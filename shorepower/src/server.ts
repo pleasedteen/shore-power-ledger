@@ -14,6 +14,7 @@ import {
   loadPublication,
   type PublicationBundle,
 } from './storage.js';
+import { buildPublicationDelta } from './sync.js';
 import { formatBeijing, formatUtc } from './time.js';
 import type { DailyAccount, QuarantineEntry } from './types.js';
 
@@ -81,6 +82,40 @@ export async function startHttpServer(dataDir: string, requestedPort: number): P
 
       if (req.method !== 'GET') {
         sendJson(res, 405, { error: '仅支持 GET' });
+        return;
+      }
+
+      // 差量导出：只服务两个“已提交发布号”之间的净变更，未提交发布号一律不接
+      if (url.pathname === '/sync') {
+        const toId = p.get('to');
+        const fromId = p.get('from'); // 可省略：下游引导同步，目标版全部文档作为新增
+        if (!toId) {
+          sendJson(res, 400, { error: '缺少查询参数 to（目标发布号）' });
+          return;
+        }
+        const ids = await listPublicationIds(dataDir);
+        if (!ids.includes(toId)) {
+          sendJson(res, 404, { error: `目标发布 ${toId} 不存在或尚未提交，差量入口不接受未提交发布号` });
+          return;
+        }
+        const toBundle = await loadPublication(dataDir, toId);
+        if (!toBundle) {
+          sendJson(res, 404, { error: `目标发布 ${toId} 无法读取` });
+          return;
+        }
+        let fromBundle: PublicationBundle | null = null;
+        if (fromId) {
+          if (!ids.includes(fromId)) {
+            sendJson(res, 404, { error: `基版发布 ${fromId} 不存在或尚未提交，差量入口不接受未提交发布号` });
+            return;
+          }
+          fromBundle = await loadPublication(dataDir, fromId);
+          if (!fromBundle) {
+            sendJson(res, 404, { error: `基版发布 ${fromId} 无法读取` });
+            return;
+          }
+        }
+        sendJson(res, 200, buildPublicationDelta(fromBundle, toBundle));
         return;
       }
 
@@ -171,6 +206,7 @@ export async function startHttpServer(dataDir: string, requestedPort: number): P
               '/quarantines?connectionId=',
               '/lineage?docId=',
               '/connection?id=',
+              '/sync?from=<基版发布号，可省略>&to=<目标发布号>',
             ],
           });
       }

@@ -8,7 +8,8 @@
  *   4. 验证修订替换、旧文档撤下、缺失补发后恢复、未涉及接电沿用；
  *   5. 再跑一次相同输入，验证幂等（不产生重复发布）；
  *   6. 模拟发布中途退出残留，验证最近完整发布仍可查询；
- *   7. 启动临时 HTTP 服务，验证单发布快照查询与跨日结果。
+ *   7. 启动临时 HTTP 服务，验证单发布快照查询、跨日结果与 /sync 净差量导出；
+ *   8. 独立下游目录走“引导 + 增量”差量同步，验证应用后与目标版指纹一致。
  */
 
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -18,7 +19,8 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { runFull, rerunDay } from '../src/pipeline.js';
-import { cleanupStaging, loadCurrentPublication } from '../src/storage.js';
+import { cleanupStaging, loadCurrentPublication, loadPublication } from '../src/storage.js';
+import { buildPublicationDelta, materializeSyncedPublication } from '../src/sync.js';
 import { startHttpServer } from '../src/server.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -194,6 +196,38 @@ async function main(): Promise<void> {
 
   const pubs = await get('/publications');
   checkTrue('历史发布可枚举', (pubs.allPublicationIds?.length ?? 0) >= 2);
+
+  // 7. 差量同步：独立下游目录先引导、再增量，应用后与目标版逐文档一致
+  console.log('\n⑦ 下游差量同步：引导拉取首版，再按净差量同步到当前发布（不下整版）');
+  const syncDir = path.join(work, 'downstream');
+  await mkdir(syncDir, { recursive: true });
+  const upstreamPub1 = await loadPublication(dataDir, first.publicationId);
+  if (!upstreamPub1) throw new Error('读不到首版发布');
+
+  const bootDelta = buildPublicationDelta(null, upstreamPub1);
+  check('引导差量基版为空', bootDelta.fromPublicationId, null);
+  check('引导差量含全部首版日账', bootDelta.accounts.added.length, 5);
+  await materializeSyncedPublication(syncDir, bootDelta, null);
+  const down1 = await loadCurrentPublication(syncDir);
+  check('下游引导后日账条数', down1?.accounts.length, 5);
+
+  const incDelta = (await get(`/sync?from=${first.publicationId}&to=${pub2.manifest.publicationId}`)) as any;
+  check('差量只含净变更（CONN-102 沿用不重传）', incDelta.stats.deltaRows < incDelta.stats.fullRows, true);
+  check('隔离转日账的旧文档进入 removed', incDelta.quarantines.removed, ['QUAR-CONN-107']);
+  await materializeSyncedPublication(syncDir, incDelta, down1);
+  const down2 = await loadCurrentPublication(syncDir);
+  check('下游增量后日账条数与目标版一致', down2?.accounts.length, pub2.accounts.length);
+  check('下游增量后隔离条数与目标版一致', down2?.quarantines.length, pub2.quarantines.length);
+  check(
+    '下游指纹与目标版一致（三类文档+血缘按目标版读取完全相同）',
+    down2?.manifest.fingerprint,
+    pub2.manifest.fingerprint,
+  );
+
+  // 未提交发布号不接
+  const badSync = await get('/sync?to=pub-not-committed-000000');
+  checkTrue('未提交发布号差量入口拒绝', typeof badSync.error === 'string' && badSync.error.includes('尚未提交'));
+
   await handle.close();
 
   console.log('\n────────────── 演示小结 ──────────────');

@@ -161,14 +161,8 @@ export async function commitPublication(
   ]);
 
   await rename(tmpDir, finalDir);
-  // 指针写入同目录临时文件后原子替换；墓碑随指针一并持久化
-  const pointerTmp = path.join(root, `${CURRENT_POINTER}.tmp-${process.pid}`);
-  const pointer: CurrentPointer = {
-    publicationId,
-    tombstoneDocIds: [...tombstoneDocIds].sort(),
-  };
-  await writeFile(pointerTmp, JSON.stringify(pointer, null, 2) + '\n');
-  await rename(pointerTmp, pointerPath(dataDir));
+  // 指针原子替换；墓碑随指针一并持久化
+  await writePointerAtomic(dataDir, publicationId, tombstoneDocIds);
   return { publicationId, skipped: false };
 }
 
@@ -191,11 +185,14 @@ export function contentFingerprint(bundle: {
     fingerprint: _fp,
     ...manifestStable
   } = bundle.manifest as PublicationManifest;
+  // 三类结果文档集合按 docId 排序后再哈希：差量同步经 Map 应用后的数组顺序
+  // 可能与发布时不同，但集合内容等价时指纹必须一致（嵌套数组如读数清单仍保序）。
+  const byDocId = (a: { docId: string }, b: { docId: string }) => a.docId.localeCompare(b.docId);
   const stable = {
     manifest: stripVolatile(manifestStable),
-    accounts: bundle.accounts.map((d) => stripVolatile(d)),
-    quarantines: bundle.quarantines.map((d) => stripVolatile(d)),
-    lineage: bundle.lineage.map((d) => stripVolatile(d)),
+    accounts: bundle.accounts.toSorted(byDocId).map((d) => stripVolatile(d)),
+    quarantines: bundle.quarantines.toSorted(byDocId).map((d) => stripVolatile(d)),
+    lineage: bundle.lineage.toSorted(byDocId).map((d) => stripVolatile(d)),
   };
   return createHash('sha256').update(canonicalJson(stable)).digest('hex');
 }
@@ -205,8 +202,10 @@ export function contentFingerprint(bundle: {
  * - 删除值为 undefined 的可选字段（JSON.stringify 落盘时本就会丢弃），
  *   保证内存态文档与写盘回读后的文档规范化结果一致；
  * - 删除任意层级的 publicationId，使相同业务内容不会仅因发布 id 不同而指纹不同。
+ *
+ * 差量同步复用该规范化：仅发布号不同、业务内容一致的文档视为零净变更。
  */
-function stripVolatile<T>(obj: T): T {
+export function stripVolatile<T>(obj: T): T {
   if (Array.isArray(obj)) {
     return obj.map((v) => stripVolatile(v)) as T;
   }
@@ -232,4 +231,29 @@ function canonicalJson(value: unknown): string {
     return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
   }
   return JSON.stringify(value);
+}
+
+/** 差量同步按业务内容比较文档时的规范化字符串（剔除 publicationId 等易变字段） */
+export function stableDocKey(doc: unknown): string {
+  return canonicalJson(stripVolatile(doc));
+}
+
+/**
+ * 原子写入 current.json 指针（同目录临时文件 + rename），墓碑随指针一并持久化。
+ * 供常规发布与下游差量同步应用共用，保证指针切换的原子性。
+ */
+export async function writePointerAtomic(
+  dataDir: string,
+  publicationId: string,
+  tombstoneDocIds: string[],
+): Promise<void> {
+  const root = publicationsRoot(dataDir);
+  await mkdir(root, { recursive: true });
+  const pointerTmp = path.join(root, `${CURRENT_POINTER}.tmp-${process.pid}`);
+  const pointer: CurrentPointer = {
+    publicationId,
+    tombstoneDocIds: [...tombstoneDocIds].sort(),
+  };
+  await writeFile(pointerTmp, JSON.stringify(pointer, null, 2) + '\n');
+  await rename(pointerTmp, pointerPath(dataDir));
 }

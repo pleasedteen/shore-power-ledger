@@ -23,7 +23,7 @@ npm run demo        # 端到端演示：生成夹具 → 发布 → 补发更正
 其它常用命令：
 
 ```bash
-npm test            # node:test 单元 + 集成测试（18 个用例）
+npm test            # node:test 单元 + 集成测试（26 个用例）
 npm run build       # TypeScript 类型检查并编译到 dist/
 npm run gen:fixtures  # 重新生成双源夹具到 fixtures/
 ```
@@ -114,6 +114,7 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 | `GET /quarantines?connectionId=` | 隔离区查询 |
 | `GET /lineage?docId=` | 按结果文档 id 查血缘 |
 | `GET /connection?id=` | 一次接电的全部日账 + 隔离 + 血缘 |
+| `GET /sync?from=&to=` | 两个**已提交发布号**之间的净差量导出（见第 6 节） |
 
 示例：
 
@@ -122,7 +123,54 @@ curl -s "http://localhost:8080/accounts?day=2026-11-04"
 curl -s "http://localhost:8080/connection?id=CONN-106"
 ```
 
-## 6. 产物与血缘
+## 6. 下游差量同步（不再下整版）
+
+下游历史日账同步按**净差量**进行：上游支持在任意两个已提交发布号之间，
+对日账、隔离、血缘三类文档导出新增 / 替换 / 删除净变更。
+
+### 导出：`GET /sync?from=<基版>&to=<目标版>`
+
+- `to` 为目标发布号（必填），`from` 为基版发布号（可省略）；
+- 省略 `from` 表示**引导同步**：下游尚无发布，目标版全部文档作为新增下发；
+- 两个发布号都必须是已提交的不可变发布；未提交 / 不存在的发布号入口直接拒绝（HTTP 404/400），
+  旧版 `publicationId=` 查询入口与行为完全不变；
+- 差量按结果文档 `docId` 对齐，分三类各给三组：
+  - `added`：基版没有、目标版新增的完整文档；
+  - `replaced`：两版同 `docId` 但业务内容变化的文档，载荷为目标版完整文档；
+  - `removed`：目标版不再保留的文档 id（含隔离转日账等形态切换的旧文档）；
+- 比较前剔除任意层级的 `publicationId` 并做规范化：**仅发布号变化、或中间改过又恢复原内容的行
+  不产生净变更、不重传**；
+- 响应自带目标版清单与业务指纹（`targetFingerprint`）及差量统计（`stats.deltaRows/fullRows`）。
+
+### 下游应用：`sync-pull`
+
+```bash
+# 空下游引导（省略 --from）
+npx tsx src/cli.ts sync-pull --upstream http://localhost:8080 --data ./data --to pub-full-xxxx
+# 之后按本地当前发布号做基版逐版增量
+npx tsx src/cli.ts sync-pull --upstream http://localhost:8080 --data ./data \
+  --from pub-full-xxxx --to pub-rerun-yyyy
+```
+
+应用流程带严格校验，绝不静默错账：
+
+1. 校验差量基版与本地当前发布一致（引导差量只能落到尚无发布的目录），不一致即拒绝；
+2. 三类文档分别校验前置条件（新增 id 本地不存在、替换/删除 id 本地存在）后合并，并盖目标发布号；
+3. 用目标版业务指纹复核应用结果——按目标版重新读取三类文档与血缘必须与目标版完全一致，
+   不符即中止且不切换指针；
+4. 先写临时发布目录再原子 `rename`，最后原子切换 `current.json`；目标版已存在时只校准指针、
+   不重复写盘，重启后重复拉取安全。
+
+### 规模特性（夹具实测口径）
+
+在 200 个接电、24 个版本每版只翻动 2 个接电（大量改撤、两端仅少量记录最终不同）的夹具下：
+
+- 首版到末版的端到端净差量仅为整版行数的约 **1%**（远低于 5%）；每版差量仅 4 行；
+- 每版改动量相近、版本数翻倍时，引导加全部差量的同步资料磁盘占用约为单版整版快照的
+  **1.7 倍**，上限不超过 **2.5 倍**；
+- 重启后重新读入并按目标版核对，三类文档键数与目标版一致、零重影。
+
+## 7. 产物与血缘
 
 ```
 data/publications/
@@ -137,7 +185,7 @@ data/publications/
 每条日账与隔离结果都有对应血缘文档，记录所依据的原始文件名、行号、记录 id、修订版本及
 文件 SHA-256，可完整追溯到原始记录及其修订版本。
 
-## 7. 目录结构
+## 8. 目录结构
 
 ```
 src/
@@ -148,8 +196,9 @@ src/
   settlement.ts  边界校验、隔离判定、按自然日拆账
   storage.ts     不可变发布、原子指针、墓碑、幂等指纹
   pipeline.ts    全量/重跑编排、血缘构建
-  server.ts      HTTP 快照查询接口
-  cli.ts         命令行入口
+  sync.ts        发布间净差量计算与下游差量应用（含指纹复核）
+  server.ts      HTTP 快照查询接口与 /sync 差量导出
+  cli.ts         命令行入口（run / rerun / serve / sync-pull）
 scripts/         夹具生成器与端到端演示
 test/            node:test 测试
 fixtures/        双源夹具（run1 / run2 / all-in-one）
