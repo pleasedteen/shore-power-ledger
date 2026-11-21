@@ -8,7 +8,8 @@
  *   4. 验证修订替换、旧文档撤下、缺失补发后恢复、未涉及接电沿用；
  *   5. 再跑一次相同输入，验证幂等（不产生重复发布）；
  *   6. 模拟发布中途退出残留，验证最近完整发布仍可查询；
- *   7. 启动临时 HTTP 服务，验证单发布快照查询与跨日结果。
+ *   7. 启动临时 HTTP 服务，验证单发布快照查询与跨日结果；
+ *   8. 批次审计：按尝试编号核对跨日更正、重复重跑与两处退出的判定。
  */
 
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -18,7 +19,13 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { runFull, rerunDay } from '../src/pipeline.js';
-import { cleanupStaging, loadCurrentPublication } from '../src/storage.js';
+import {
+  cleanupStaging,
+  commitPublication,
+  loadCurrentPublication,
+  readPointer,
+} from '../src/storage.js';
+import { readAttemptAudit, startAttempt } from '../src/audit.js';
 import { startHttpServer } from '../src/server.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -41,6 +48,13 @@ function checkTrue(label: string, cond: boolean): void {
 
 async function copyTree(src: string, dst: string): Promise<void> {
   await cp(src, dst, { recursive: true });
+}
+
+/** 包装 runFull/rerunDay，打印本次批次尝试编号 */
+async function audited<T extends { attemptId: string }>(label: string, p: Promise<T>): Promise<T> {
+  const out = await p;
+  console.log(`   ${label} 批次尝试编号：${out.attemptId}`);
+  return out;
 }
 
 async function main(): Promise<void> {
@@ -69,7 +83,7 @@ async function main(): Promise<void> {
 
   // 2. 首次全量发布
   console.log('\n② 首次全量发布（仅 run1 文件）');
-  const first = await runFull(inputDir, dataDir);
+  const first = await audited('首次全量发布', runFull(inputDir, dataDir));
   checkTrue('首次发布产生新版本', !first.skipped);
   check('日账条数', first.accountCount, 5);
   check('隔离条数', first.quarantineCount, 4);
@@ -109,7 +123,7 @@ async function main(): Promise<void> {
     path.join(fixturesRoot, 'run2', 'readings'),
     path.join(inputDir, 'readings'),
   );
-  const second = await rerunDay(inputDir, dataDir, '2026-11-04');
+  const second = await audited('重跑 11-04', rerunDay(inputDir, dataDir, '2026-11-04'));
   checkTrue('重跑产生新版本', !second.skipped);
   const pub2 = await loadCurrentPublication(dataDir);
   if (!pub2) throw new Error('重跑后读不到当前发布');
@@ -149,7 +163,7 @@ async function main(): Promise<void> {
 
   // 4. 相同输入再重跑：幂等
   console.log('\n④ 相同输入再次重跑，验证幂等（不产生重复发布）');
-  const third = await rerunDay(inputDir, dataDir, '2026-11-04');
+  const third = await audited('重复重跑 11-04', rerunDay(inputDir, dataDir, '2026-11-04'));
   checkTrue('重复运行被跳过', third.skipped);
   check('指针仍指向上一完整发布', third.publicationId, pub2.manifest.publicationId);
 
@@ -196,9 +210,121 @@ async function main(): Promise<void> {
   checkTrue('历史发布可枚举', (pubs.allPublicationIds?.length ?? 0) >= 2);
   await handle.close();
 
+  // 7. 批次审计：按尝试编号核对跨日更正、重复重跑与两处退出
+  console.log('\n⑦ 批次审计：按尝试编号查询基线、发布结果与接电处置');
+
+  const audit1 = (await readAttemptAudit(dataDir, first.attemptId))!;
+  check('首次尝试状态', audit1.statusLabel, '已发布');
+  check('首次尝试无基线', audit1.baseline, null);
+  check('首次尝试记录发布结果', audit1.result?.publicationId, first.publicationId);
+
+  // 跨日更正重跑：CONN-101 修订跨两日，审计需说明纳入/沿用/撤下
+  const audit2 = (await readAttemptAudit(dataDir, second.attemptId))!;
+  check('重跑尝试状态', audit2.statusLabel, '已发布');
+  check('重跑尝试基线为首次发布', audit2.baseline?.publicationId, first.publicationId);
+  const decisionOf = (audit: typeof audit2, id: string) =>
+    audit.decisions.find((d) => d.connectionId === id);
+  check('CONN-101 纳入重算', decisionOf(audit2, 'CONN-101')?.action, 'recomputed');
+  checkTrue(
+    'CONN-101 纳入原因说明与 11-04 重叠',
+    (decisionOf(audit2, 'CONN-101')?.reason ?? '').includes('2026-11-04'),
+  );
+  check('CONN-102 沿用', decisionOf(audit2, 'CONN-102')?.action, 'carried');
+  check('重跑尝试撤下清单', audit2.result?.withdrawnDocIds, ['QUAR-CONN-107']);
+
+  // 重复重跑：单独编号，状态为幂等跳过（与已发布区分）
+  const audit3 = (await readAttemptAudit(dataDir, third.attemptId))!;
+  check('重复重跑状态', audit3.statusLabel, '幂等跳过');
+  check('重复重跑未产生新发布', audit3.result?.publicationId, second.publicationId);
+
+  // 7a. 发布切换前退出：已写 pending 但指针未切换 → 未完成
+  const crashedBefore = await startAttempt(dataDir, {
+    mode: 'rerun',
+    rerunDay: '2026-11-04',
+    baseline: { publicationId: second.publicationId, fingerprint: pub2.manifest.fingerprint },
+  });
+  await crashedBefore.markPublishing('pub-rerun-exit-before-switch', {
+    accountCount: 0,
+    quarantineCount: 0,
+    withdrawnDocIds: [],
+  });
+  // 进程此刻退出：不提交发布、不写终态
+  const beforeAudit = (await readAttemptAudit(dataDir, crashedBefore.attemptId))!;
+  check('切换前退出判定为未完成', beforeAudit.statusLabel, '未完成');
+  check('切换前退出不声称已发布（result 为空）', beforeAudit.result, null);
+  check('切换前退出保留待发布 id', beforeAudit.pendingPublicationId, 'pub-rerun-exit-before-switch');
+
+  // 7b. 发布切换后退出：指针已切换但审计终态未落盘 → 已发布
+  const crashedAfter = await startAttempt(dataDir, {
+    mode: 'rerun',
+    rerunDay: '2026-11-04',
+    baseline: { publicationId: second.publicationId },
+  });
+  const exitedPub = 'pub-rerun-exit-after-switch';
+  await crashedAfter.markPublishing(exitedPub, {
+    accountCount: pub2.accounts.length,
+    quarantineCount: pub2.quarantines.length,
+    withdrawnDocIds: ['QUAR-CONN-107'],
+  });
+  // 真实地完成指针切换（模拟“切换成功但随后立刻退出”），省略 markPublished
+  const stamp2 = <T>(v: T): T => {
+    if (Array.isArray(v)) return v.map(stamp2) as T;
+    if (v !== null && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        out[k] = k === 'publicationId' ? exitedPub : stamp2(val);
+      }
+      return out as T;
+    }
+    return v;
+  };
+  await commitPublication(
+    dataDir,
+    {
+      manifest: {
+        ...pub2.manifest,
+        publicationId: exitedPub,
+        attemptId: crashedAfter.attemptId,
+        createdAtMs: Date.now(),
+        fingerprint: 'demo-exit-after-switch',
+      },
+      accounts: stamp2(pub2.accounts),
+      quarantines: stamp2(pub2.quarantines),
+      lineage: stamp2(pub2.lineage),
+    },
+    audit2.result?.withdrawnDocIds ?? [],
+  );
+  const afterAudit = (await readAttemptAudit(dataDir, crashedAfter.attemptId))!;
+  check('切换后退出判定为已发布', afterAudit.statusLabel, '已发布');
+  check('切换后退出结果指向实际发布', afterAudit.result?.publicationId, exitedPub);
+
+  // 7c. 后续又发布新版本：旧尝试判定不漂移
+  await runFull(inputDir, dataDir); // 当前输入即 all-in-one 视图，产生新发布
+  const newPointer = await readPointer(dataDir);
+  checkTrue('后续发布已切换指针', newPointer?.publicationId !== exitedPub);
+  const afterLaterRun = (await readAttemptAudit(dataDir, crashedAfter.attemptId))!;
+  check('后续发布后旧尝试仍为已发布', afterLaterRun.statusLabel, '已发布');
+  check('后续发布后旧尝试结果不漂移', afterLaterRun.result?.publicationId, exitedPub);
+  const beforeStill = (await readAttemptAudit(dataDir, crashedBefore.attemptId))!;
+  check('后续发布后切换前退出仍为未完成', beforeStill.statusLabel, '未完成');
+
+  // 7d. HTTP 按编号查询该次审计
+  const auditHandle = await startHttpServer(dataDir, 0);
+  const auditBase = `http://localhost:${auditHandle.port}`;
+  const auditResp = (await (
+    await fetch(`${auditBase}/audit/attempt?attemptId=${second.attemptId}`)
+  ).json()) as Record<string, any>;
+  check('HTTP 审计查询状态', auditResp.statusLabel, '已发布');
+  check('HTTP 审计查询基线', auditResp.baseline?.publicationId, first.publicationId);
+  checkTrue('HTTP 审计查询返回接电处置', (auditResp.decisions?.length ?? 0) > 0);
+  const audit404 = await fetch(`${auditBase}/audit/attempt?attemptId=att-nope`);
+  check('HTTP 审计查询缺失尝试返回 404', audit404.status, 404);
+  await auditHandle.close();
+
   console.log('\n────────────── 演示小结 ──────────────');
   console.log(`工作目录（临时）：${work}`);
   console.log('存储布局：data/publications/<pub-id>/{daily-accounts,quarantines,lineage}.jsonl + manifest.json');
+  console.log('审计布局：data/audit/attempts/<attemptId>.json（按编号直读，不枚举历史发布）');
   if (failures === 0) {
     console.log('全部检查通过 ✅');
   } else {

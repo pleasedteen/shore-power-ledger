@@ -23,7 +23,7 @@ npm run demo        # 端到端演示：生成夹具 → 发布 → 补发更正
 其它常用命令：
 
 ```bash
-npm test            # node:test 单元 + 集成测试（18 个用例）
+npm test            # node:test 单元 + 集成测试（24 个用例）
 npm run build       # TypeScript 类型检查并编译到 dist/
 npm run gen:fixtures  # 重新生成双源夹具到 fixtures/
 ```
@@ -103,13 +103,14 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 
 ## 5. HTTP 查询接口
 
-每个请求开始时读取一次当前指针，请求内全部数据来自同一发布目录，实现单发布快照隔离；
+每请求开始时读取一次当前指针，请求内全部数据来自同一发布目录，实现单发布快照隔离；
 加 `publicationId=<id>` 可查询指定历史发布。
 
 | 路径 | 说明 |
 | --- | --- |
 | `GET /health` | 健康检查与当前快照信息 |
 | `GET /publications` | 当前发布清单 + 全部历史发布 id |
+| `GET /audit/attempt?attemptId=` | 按批次尝试编号查询该次审计（见 §5.1） |
 | `GET /accounts?day=&connectionId=&vessel=&meterId=` | 日账查询，可跨日按条件过滤 |
 | `GET /quarantines?connectionId=` | 隔离区查询 |
 | `GET /lineage?docId=` | 按结果文档 id 查血缘 |
@@ -120,18 +121,51 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 ```bash
 curl -s "http://localhost:8080/accounts?day=2026-11-04"
 curl -s "http://localhost:8080/connection?id=CONN-106"
+curl -s "http://localhost:8080/audit/attempt?attemptId=att-rerun-20261121180044-jrsv5l"
 ```
+
+### 5.1 批次审计（按尝试编号）
+
+每次 `run` / `rerun` 开始时分配一个**批次尝试编号**（`RunOutcome.attemptId`，CLI 也会打印），
+并把该次尝试的元数据写入 `data/audit/attempts/<attemptId>.json`：
+
+- **基线版本**：本次开始时 `current` 指针指向的发布 id 及其指纹；
+- **发布结果**：本次产生的发布 id、日账/隔离条数、撤下文档清单、幂等跳过原因；
+- **接电处置**：每条接电为何被**纳入重算**（并注明依据是最新窗口还是上一版窗口与目标日重叠）、
+  **沿用**上一版，或**撤下**（含被撤下的旧文档 id 与中文原因）。
+
+查询只按编号直读该尝试文件；仅当状态尚未收敛时再读一次 `current` 指针。
+不加载日账/隔离/血缘，也不枚举历史发布目录，**读取量与历史版本数、文档条数无关**。
+
+状态区分三种：
+
+| 状态 | 含义 |
+| --- | --- |
+| `published`（已发布） | 指针已切换到本尝试的发布，结果为该次发布 |
+| `skipped`（幂等跳过） | 内容指纹与当前发布一致，未切换指针，结果为所沿用的发布 |
+| `incomplete`（未完成） | 进程在发布切换前退出或异常终止，未产生可查询的新发布 |
+
+**退出与时序**：尝试编号与发布 id 在同一次原子指针写入中落盘，因此指针切换是“已发布”的唯一证据。
+
+- 进程在**发布切换前**退出（可能已写 pending、已写半成品目录）：指针不会指向该尝试，判定未完成；
+- 进程在**发布切换后、审计终态落盘前**退出：指针里的尝试编号仍与该尝试一致，查询直接判定已发布；
+- 之后**又发布了新版本**：新运行动手改指针前，会先用当时的指针把遗留 pending 尝试固化
+  （已发布或未完成），因此旧尝试的判定**不会随后续发布漂移**。
+
 
 ## 6. 产物与血缘
 
 ```
 data/publications/
-├── current.json                     # 指针 + 累积墓碑
+├── current.json                     # 指针 + 尝试编号 + 累积墓碑
 └── pub-full-20261118xxxxxx-xxxxxx/
     ├── daily-accounts.jsonl         # 日账（每日用量 Wh/kWh、边界读数、读数清单）
     ├── quarantines.jsonl            # 隔离结果（原因码、中文说明、证据）
     ├── lineage.jsonl                # 血缘（接电/读数出处、输入文件清单与哈希）
-    └── manifest.json                # 发布清单（模式、计数、撤下、告警、指纹）
+    └── manifest.json                # 发布清单（模式、计数、撤下、告警、指纹、尝试编号）
+data/audit/
+├── attempts/<attemptId>.json        # 每次尝试的审计（基线、结果、接电处置）
+└── pending/<attemptId>.json         # 待对账标记（切换后、终态落盘前退出时用于判定）
 ```
 
 每条日账与隔离结果都有对应血缘文档，记录所依据的原始文件名、行号、记录 id、修订版本及
@@ -147,7 +181,8 @@ src/
   ingest.ts      双源扫描、哈希去重、修订合并、出处采集
   settlement.ts  边界校验、隔离判定、按自然日拆账
   storage.ts     不可变发布、原子指针、墓碑、幂等指纹
-  pipeline.ts    全量/重跑编排、血缘构建
+  audit.ts       批次尝试编号、审计记录、pending 对账
+  pipeline.ts    全量/重跑编排、血缘构建、审计写入
   server.ts      HTTP 快照查询接口
   cli.ts         命令行入口
 scripts/         夹具生成器与端到端演示

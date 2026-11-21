@@ -153,6 +153,11 @@ export interface LineageRecord {
 export interface PublicationManifest {
   docType: 'manifest';
   publicationId: string;
+  /**
+   * 产生本次发布的批次尝试编号。
+   * 仅用于审计追溯，不参与内容指纹（相同输入重跑仍保持幂等）。
+   */
+  attemptId?: string;
   createdAtMs: number;
   /** full：全量发布；rerun：指定日期重跑 */
   mode: 'full' | 'rerun';

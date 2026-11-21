@@ -6,16 +6,24 @@
  * - 对纳入的接电重新结算，在所有相关日期替换其日账/隔离/血缘；
  * - 上一版中已失效（最新输入里被更高修订取代、或不再出现）的旧接电结果随替换撤下；
  * - 其余接电沿用各自已经发布的结果（文档复制到新发布，保持快照完整）。
+ *
+ * 每次运行都会分配一个批次尝试编号（attemptId），把本次使用的基线发布、
+ * 发布结果与每条接电的纳入/沿用/撤下原因写入审计（见 audit.ts）。
  */
 
+import {
+  reconcilePendingAttempts,
+  startAttempt,
+  type AttemptConnectionDecision,
+  type AttemptHandle,
+} from './audit.js';
 import { ingest } from './ingest.js';
 import { settleConnection } from './settlement.js';
 import {
   commitPublication,
   contentFingerprint,
-  loadCurrentPublication,
-  loadTombstones,
-  type PublicationBundle,
+  loadPublication,
+  readPointer,
 } from './storage.js';
 import { overlapsDay } from './time.js';
 import type {
@@ -29,6 +37,8 @@ import type {
 } from './types.js';
 
 export interface RunOutcome {
+  /** 本次运行的批次尝试编号（审计可按此编号查询） */
+  attemptId: string;
   publicationId: string;
   /** skipped=true 表示内容与当前发布一致，未产生新发布 */
   skipped: boolean;
@@ -42,7 +52,7 @@ export interface RunOutcome {
 }
 
 function newPublicationId(mode: 'full' | 'rerun'): string {
-  const ts = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14);
+  const ts = new Date().toISOString().replace(/[-:TZ]/g, '').slice(0, 14);
   return `pub-${mode}-${ts}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
@@ -176,7 +186,8 @@ async function publish(
   carriedIds: string[],
   withdrawnDocIds: string[],
   warnings: string[],
-  previous: PublicationBundle | null,
+  previous: import('./storage.js').PublicationBundle | null,
+  attempt: AttemptHandle,
 ): Promise<RunOutcome> {
   const publicationId = newPublicationId(mode);
 
@@ -203,6 +214,8 @@ async function publish(
   const manifestWithoutFingerprint: Omit<PublicationManifest, 'fingerprint'> = {
     docType: 'manifest',
     publicationId,
+    // 尝试编号写入清单，便于从一次发布反查其批次审计；不参与内容指纹。
+    attemptId: attempt.attemptId,
     createdAtMs: Date.now(),
     mode,
     rerunDay,
@@ -225,7 +238,13 @@ async function publish(
 
   // 幂等：与当前发布业务内容完全一致时不产生新发布
   if (previous && previous.manifest.fingerprint === fingerprint) {
+    await attempt.markSkipped(previous.manifest.publicationId, '相同输入与结算结果，内容指纹一致，跳过重复发布', {
+      accountCount: previous.manifest.accountCount,
+      quarantineCount: previous.manifest.quarantineCount,
+      withdrawnDocIds,
+    });
     return {
+      attemptId: attempt.attemptId,
       publicationId: previous.manifest.publicationId,
       skipped: true,
       reason: '相同输入与结算结果，内容指纹一致，跳过重复发布',
@@ -238,8 +257,16 @@ async function publish(
     };
   }
 
+  // 进入发布：先记录目标发布 id 与 pending 标记，再原子切换指针。
+  await attempt.markPublishing(publicationId, {
+    accountCount: accounts.length,
+    quarantineCount: quarantines.length,
+    withdrawnDocIds,
+  });
   await commitPublication(dataDir, { manifest, accounts, quarantines, lineage }, withdrawnDocIds);
+  await attempt.markPublished();
   return {
+    attemptId: attempt.attemptId,
     publicationId,
     skipped: false,
     accountCount: accounts.length,
@@ -251,13 +278,36 @@ async function publish(
   };
 }
 
-/** 全量运行：重新结算输入中的全部接电 */
-export async function runFull(inputDir: string, dataDir: string): Promise<RunOutcome> {
-  const [{ connections, readings, files, warnings }, previous, historyTombstones] = await Promise.all([
-    ingest(inputDir),
-    loadCurrentPublication(dataDir),
-    loadTombstones(dataDir),
-  ]);
+/** 把被撤下文档归到具体接电，便于审计说明“为何撤下” */
+function groupWithdrawnByConnection(
+  withdrawnDocIds: string[],
+  previous: import('./storage.js').PublicationBundle | null,
+): Map<string, string[]> {
+  const docToConn = new Map<string, string>();
+  if (previous) {
+    for (const d of [...previous.accounts, ...previous.quarantines]) {
+      docToConn.set(d.docId, d.connectionId);
+    }
+  }
+  const out = new Map<string, string[]>();
+  for (const id of withdrawnDocIds) {
+    const conn = docToConn.get(id);
+    if (!conn) continue;
+    const list = out.get(conn) ?? [];
+    list.push(id);
+    out.set(conn, list);
+  }
+  return out;
+}
+
+async function runFullCore(
+  inputDir: string,
+  dataDir: string,
+  previous: import('./storage.js').PublicationBundle | null,
+  historyTombstones: string[],
+  attempt: AttemptHandle,
+): Promise<RunOutcome> {
+  const { connections, readings, files, warnings } = await ingest(inputDir);
   const { connectionIds } = extractRevisionConflictIds(warnings);
 
   const recomputed = recompute(connections, readings, files, '__pending__', connectionIds, warnings);
@@ -275,6 +325,28 @@ export async function runFull(inputDir: string, dataDir: string): Promise<RunOut
     : [];
   const withdrawnDocIds = [...new Set([...historyTombstones, ...newWithdrawals])].sort();
 
+  // 审计：全量运行重新结算输入中的全部接电；被撤下的旧文档归到对应接电
+  const withdrawalsByConn = groupWithdrawnByConnection(newWithdrawals, previous);
+  const decisions: AttemptConnectionDecision[] = connections.map((c) => ({
+    connectionId: c.connectionId,
+    action: 'recomputed',
+    reason: '全量运行：重新结算输入中的全部接电',
+    revision: c.revision,
+    ...(withdrawalsByConn.has(c.connectionId)
+      ? { withdrawnDocIds: withdrawalsByConn.get(c.connectionId)!.sort() }
+      : {}),
+  }));
+  for (const [connId, docs] of withdrawalsByConn) {
+    if (connections.some((c) => c.connectionId === connId)) continue;
+    decisions.push({
+      connectionId: connId,
+      action: 'withdrawn',
+      reason: '全量运行后该接电不再出现在输入中，其旧结果被撤下',
+      withdrawnDocIds: [...docs].sort(),
+    });
+  }
+  await attempt.setDecisions(decisions, warnings);
+
   return publish(
     dataDir,
     'full',
@@ -286,33 +358,40 @@ export async function runFull(inputDir: string, dataDir: string): Promise<RunOut
     withdrawnDocIds,
     warnings,
     previous,
+    attempt,
   );
 }
 
-/** 指定北京时间日期重跑 */
-export async function rerunDay(
+async function rerunCore(
   inputDir: string,
   dataDir: string,
   day: string,
+  previous: import('./storage.js').PublicationBundle | null,
+  historyTombstones: string[],
+  attempt: AttemptHandle,
 ): Promise<RunOutcome> {
-  const [{ connections, readings, files, warnings }, previous, historyTombstones] = await Promise.all([
-    ingest(inputDir),
-    loadCurrentPublication(dataDir),
-    loadTombstones(dataDir),
-  ]);
+  const { connections, readings, files, warnings } = await ingest(inputDir);
 
   if (!previous) {
-    // 没有历史发布可沿用，退化为全量运行
-    return runFull(inputDir, dataDir);
+    // 没有历史发布可沿用，退化为全量运行（attempt 仍记录为本次尝试）
+    return runFullCore(inputDir, dataDir, null, historyTombstones, attempt);
   }
 
   const { connectionIds } = extractRevisionConflictIds(warnings);
   const latestById = new Map(connections.map((c) => [c.connectionId, c]));
 
-  // 纳入集合：最新接电时段与该日重叠，或上一版发布接电时段与该日重叠
+  // 纳入集合：最新接电时段与该日重叠，或上一版发布接电时段与该日重叠。
+  // 同时记录纳入依据（latest / previous），供审计说明“为何纳入”。
   const includedIds = new Set<string>();
+  const basisById = new Map<string, Set<'latest' | 'previous'>>();
+  const markIncluded = (id: string, basis: 'latest' | 'previous') => {
+    includedIds.add(id);
+    const set = basisById.get(id) ?? new Set<'latest' | 'previous'>();
+    set.add(basis);
+    basisById.set(id, set);
+  };
   for (const c of connections) {
-    if (overlapsDay(c.startBeijingMs, c.endBeijingMs, day)) includedIds.add(c.connectionId);
+    if (overlapsDay(c.startBeijingMs, c.endBeijingMs, day)) markIncluded(c.connectionId, 'latest');
   }
   const previousConnWindows = new Map<string, { start: number; end: number }>();
   for (const q of previous.quarantines) {
@@ -334,7 +413,7 @@ export async function rerunDay(
     }
   }
   for (const [id, w] of previousConnWindows) {
-    if (overlapsDay(w.start, w.end, day)) includedIds.add(id);
+    if (overlapsDay(w.start, w.end, day)) markIncluded(id, 'previous');
   }
 
   const includedConnections: ConnectionRecord[] = [];
@@ -382,6 +461,43 @@ export async function rerunDay(
     );
   }
 
+  // 审计：逐条说明纳入（含依据）/ 沿用 / 撤下原因
+  const withdrawalsByConn = groupWithdrawnByConnection(newWithdrawals, previous);
+  const decisions: AttemptConnectionDecision[] = [];
+  for (const conn of includedConnections) {
+    const basis = [...(basisById.get(conn.connectionId) ?? new Set<'latest'>())].sort();
+    const basisLabel = basis
+      .map((b) => (b === 'latest' ? '最新接电窗口' : '上一版接电窗口'))
+      .join(' / ');
+    decisions.push({
+      connectionId: conn.connectionId,
+      action: 'recomputed',
+      reason: `接电时段与 ${day} 重叠（依据：${basisLabel}），纳入重算`,
+      basis,
+      revision: conn.revision,
+      ...(withdrawalsByConn.has(conn.connectionId)
+        ? { withdrawnDocIds: withdrawalsByConn.get(conn.connectionId)!.sort() }
+        : {}),
+    });
+  }
+  for (const id of missingIncluded) {
+    decisions.push({
+      connectionId: id,
+      action: 'withdrawn',
+      reason: `上一版接电时段与 ${day} 重叠，但最新输入已无此接电，旧结果被撤下`,
+      basis: [...(basisById.get(id) ?? new Set<'previous'>())].sort(),
+      ...(withdrawalsByConn.has(id) ? { withdrawnDocIds: withdrawalsByConn.get(id)!.sort() } : {}),
+    });
+  }
+  for (const id of carriedIds) {
+    decisions.push({
+      connectionId: id,
+      action: 'carried',
+      reason: `接电时段与 ${day} 不重叠，沿用上一版结果`,
+    });
+  }
+  await attempt.setDecisions(decisions, warnings);
+
   return publish(
     dataDir,
     'rerun',
@@ -393,5 +509,55 @@ export async function rerunDay(
     withdrawnDocIds,
     warnings,
     previous,
+    attempt,
   );
+}
+
+/**
+ * 统一入口：先对账遗留的 pending 尝试（用当时的指针固化其判定），
+ * 再读取基线、分配尝试编号，然后执行具体模式。
+ */
+async function withAttempt(
+  inputDir: string,
+  dataDir: string,
+  requested: { mode: 'full' | 'rerun'; day?: string },
+): Promise<RunOutcome> {
+  // 后续运行会改动指针，先固化旧尝试的最终判定，保证旧尝试判定随后续发布不漂移
+  await reconcilePendingAttempts(dataDir);
+  const pointer = await readPointer(dataDir);
+  const previous = pointer ? await loadPublication(dataDir, pointer.publicationId) : null;
+  // 指定日重跑若没有基线发布，退化为全量；审计如实记录实际执行的模式
+  const effectiveMode: 'full' | 'rerun' = requested.mode === 'rerun' && !previous ? 'full' : requested.mode;
+
+  const attempt = await startAttempt(dataDir, {
+    mode: effectiveMode,
+    rerunDay: effectiveMode === 'rerun' ? requested.day : undefined,
+    baseline: pointer
+      ? { publicationId: pointer.publicationId, fingerprint: previous?.manifest.fingerprint }
+      : null,
+  });
+
+  try {
+    const historyTombstones = pointer?.tombstoneDocIds ?? [];
+    return effectiveMode === 'full'
+      ? await runFullCore(inputDir, dataDir, previous, historyTombstones, attempt)
+      : await rerunCore(inputDir, dataDir, requested.day!, previous, historyTombstones, attempt);
+  } catch (err) {
+    await attempt.markIncomplete(err instanceof Error ? err.message : String(err));
+    throw err;
+  }
+}
+
+/** 全量运行：重新结算输入中的全部接电 */
+export async function runFull(inputDir: string, dataDir: string): Promise<RunOutcome> {
+  return withAttempt(inputDir, dataDir, { mode: 'full' });
+}
+
+/** 指定北京时间日期重跑 */
+export async function rerunDay(
+  inputDir: string,
+  dataDir: string,
+  day: string,
+): Promise<RunOutcome> {
+  return withAttempt(inputDir, dataDir, { mode: 'rerun', day });
 }

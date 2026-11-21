@@ -36,6 +36,7 @@ function parseArgs(argv: string[]): CliArgs {
 
 function printOutcome(out: RunOutcome): void {
   console.log('────────────── 发布结果 ──────────────');
+  console.log(`   批次尝试编号：${out.attemptId}`);
   if (out.skipped) {
     console.log(`⏭  跳过新发布：${out.reason}`);
     console.log(`   当前发布仍为：${out.publicationId}`);

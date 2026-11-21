@@ -8,6 +8,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { URL } from 'node:url';
+import { readAttemptAudit } from './audit.js';
 import {
   listPublicationIds,
   loadCurrentPublication,
@@ -81,6 +82,22 @@ export async function startHttpServer(dataDir: string, requestedPort: number): P
 
       if (req.method !== 'GET') {
         sendJson(res, 405, { error: '仅支持 GET' });
+        return;
+      }
+
+      // 审计查询：只按尝试编号读取该次元数据，不依赖 current 发布、不枚举历史发布。
+      if (url.pathname === '/audit/attempt') {
+        const attemptId = p.get('attemptId');
+        if (!attemptId) {
+          sendJson(res, 400, { error: '缺少查询参数 attemptId' });
+          return;
+        }
+        const audit = await readAttemptAudit(dataDir, attemptId);
+        if (!audit) {
+          sendJson(res, 404, { error: `尝试 ${attemptId} 不存在` });
+          return;
+        }
+        sendJson(res, 200, audit);
         return;
       }
 
@@ -171,6 +188,7 @@ export async function startHttpServer(dataDir: string, requestedPort: number): P
               '/quarantines?connectionId=',
               '/lineage?docId=',
               '/connection?id=',
+              '/audit/attempt?attemptId=',
             ],
           });
       }

@@ -34,8 +34,14 @@ export interface PublicationBundle {
 const PUBLICATIONS_DIR = 'publications';
 const CURRENT_POINTER = 'current.json';
 
-interface CurrentPointer {
+export interface CurrentPointer {
   publicationId: string;
+  /**
+   * 产生该发布的批次尝试编号。
+   * 与 publicationId 一起原子写入，作为“发布切换确实发生”的持久证据：
+   * 进程若在切换指针之后、写审计终态之前退出，审计仍能据此判定该尝试已发布。
+   */
+  attemptId?: string;
   /**
    * 跨发布累积的文档墓碑：曾经被撤下的结果文档 id。
    * 重跑时某文档可能在“上一版”里已经不存在，单靠相邻两版对比会让撤下清单
@@ -53,10 +59,14 @@ function pointerPath(dataDir: string): string {
 }
 
 /** 读取当前指针；无发布时返回 null（含空墓碑的初始态由 commitPublication 建立） */
-async function readPointer(dataDir: string): Promise<CurrentPointer | null> {
+export async function readPointer(dataDir: string): Promise<CurrentPointer | null> {
   try {
     const raw = JSON.parse(await readFile(pointerPath(dataDir), 'utf-8')) as CurrentPointer;
-    return { publicationId: raw.publicationId, tombstoneDocIds: raw.tombstoneDocIds ?? [] };
+    return {
+      publicationId: raw.publicationId,
+      attemptId: raw.attemptId,
+      tombstoneDocIds: raw.tombstoneDocIds ?? [],
+    };
   } catch {
     return null;
   }
@@ -161,10 +171,12 @@ export async function commitPublication(
   ]);
 
   await rename(tmpDir, finalDir);
-  // 指针写入同目录临时文件后原子替换；墓碑随指针一并持久化
+  // 指针写入同目录临时文件后原子替换；墓碑随指针一并持久化。
+  // 尝试编号与 publicationId 同一次原子写入——指针切换是“已发布”的唯一事实来源。
   const pointerTmp = path.join(root, `${CURRENT_POINTER}.tmp-${process.pid}`);
   const pointer: CurrentPointer = {
     publicationId,
+    attemptId: bundle.manifest.attemptId,
     tombstoneDocIds: [...tombstoneDocIds].sort(),
   };
   await writeFile(pointerTmp, JSON.stringify(pointer, null, 2) + '\n');
@@ -187,6 +199,7 @@ export function contentFingerprint(bundle: {
   // 这里显式剔除，避免易变字段污染指纹。
   const {
     publicationId: _pubId,
+    attemptId: _attemptId,
     createdAtMs: _createdAt,
     fingerprint: _fp,
     ...manifestStable
