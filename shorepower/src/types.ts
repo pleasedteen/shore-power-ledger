@@ -145,8 +145,17 @@ export interface LineageRecord {
   connectionSources: SourceRef[];
   /** 依据的全部读数记录出处（去重后） */
   readingSources: SourceRef[];
-  /** 本次发布扫描到的输入文件清单 */
-  inputFiles: InputFileInfo[];
+  /**
+   * 结算时输入文件清单快照的根 id（内容寻址存储，见 src/objectstore.ts）。
+   * 清单不再逐条复制进每条血缘；查询时按该根 id 直接展开整份快照。
+   * 沿用的旧结果保留其原始根 id，因此仍返回原结算时的清单。
+   */
+  fileListRoot?: string;
+  /**
+   * 旧版发布把整批清单内联在每条血缘里；读取旧 JSONL 时原样保留。
+   * 新发布只写 fileListRoot，不再写该字段。
+   */
+  inputFiles?: InputFileInfo[];
 }
 
 /** 发布清单：一次完整发布的元数据 */
@@ -158,9 +167,30 @@ export interface PublicationManifest {
   mode: 'full' | 'rerun';
   /** rerun 时运营人员指定的北京时间日期 */
   rerunDay?: string;
+  /**
+   * 本次发布扫描到的输入文件清单快照根 id（内容寻址存储）。
+   * 落盘只写该引用；读取时展开为 inputFiles 以保持原有 API/HTTP 形状。
+   */
+  fileListRoot?: string;
+  /** 存储格式版本：2 = 内容寻址增量存储；缺省表示旧版 JSONL 发布 */
+  storageVersion?: number;
+  /** 日账索引树根 id：docId -> { 内容哈希, 过滤字段 } */
+  accountsIndexRoot?: string;
+  /** 隔离索引树根 id：docId -> { 内容哈希, connectionId } */
+  quarantinesIndexRoot?: string;
+  /** 血缘索引树根 id：subjectDocId -> { 内容哈希, connectionId } */
+  lineageIndexRoot?: string;
+  /** 输入文件清单（读取时由 fileListRoot 展开；旧版发布直接内联） */
   inputFiles: InputFileInfo[];
   accountCount: number;
   quarantineCount: number;
+  /**
+   * 以下三组接电/文档 id 集合体量随业务规模线性增长，落盘时同样改为内容寻址树，
+   * 发布清单只保存根 id；读取时展开以保持原有 API 形状。
+   */
+  recomputedConnectionIdsRoot?: string;
+  carriedConnectionIdsRoot?: string;
+  withdrawnDocIdsRoot?: string;
   /** 本次发布涉及（重新计算）的接电 id */
   recomputedConnectionIds: string[];
   /** 沿用上一版结果的接电 id */
@@ -181,3 +211,15 @@ export interface SettlementResult {
   /** 血缘中引用的全部读数出处 */
   readingSources: SourceRef[];
 }
+
+/**
+ * 存储态文档：落盘到内容寻址存储时不带 publicationId，
+ * 这样内容相同的文档（例如沿用的旧结果）跨发布只存一份。
+ * 读取时由存储层按发布号补回 publicationId。
+ */
+export type StoredDailyAccount = Omit<DailyAccount, 'publicationId'>;
+export type StoredQuarantineEntry = Omit<QuarantineEntry, 'publicationId'>;
+export type StoredLineageRecord = Omit<LineageRecord, 'publicationId' | 'inputFiles'> & {
+  /** 仅旧版 JSONL 发布内联保存；新发布只写 fileListRoot */
+  inputFiles?: InputFileInfo[];
+};

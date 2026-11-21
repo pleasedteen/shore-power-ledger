@@ -14,6 +14,7 @@
     "rerun": "tsx src/cli.ts rerun",
     "demo": "tsx scripts/demo.ts",
     "gen:fixtures": "tsx scripts/generate-fixtures.ts",
+    "gen:scale": "tsx scripts/generate-scale-fixtures.ts",
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {

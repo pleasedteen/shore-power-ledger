@@ -23,9 +23,10 @@ npm run demo        # 端到端演示：生成夹具 → 发布 → 补发更正
 其它常用命令：
 
 ```bash
-npm test            # node:test 单元 + 集成测试（18 个用例）
+npm test            # node:test 单元 + 集成 + 规模/存储测试（36 个用例）
 npm run build       # TypeScript 类型检查并编译到 dist/
 npm run gen:fixtures  # 重新生成双源夹具到 fixtures/
+npm run gen:scale -- --out ./scale-input --count 2000 --files 2000  # 规模夹具（首发压测）
 ```
 
 ## 2. 输入数据格式
@@ -103,8 +104,9 @@ npx tsx src/cli.ts serve --data ./data --port 8080
 
 ## 5. HTTP 查询接口
 
-每个请求开始时读取一次当前指针，请求内全部数据来自同一发布目录，实现单发布快照隔离；
-加 `publicationId=<id>` 可查询指定历史发布。
+每个请求开始时解析一次当前指针（或指定的发布号），请求内全部数据来自同一发布及其
+内容寻址对象，实现单发布快照隔离；加 `publicationId=<id>` 可查询指定历史发布。
+按发布号点查血缘只下钻该发布的索引树，重启后也无需逐版回放。
 
 | 路径 | 说明 |
 | --- | --- |
@@ -124,18 +126,45 @@ curl -s "http://localhost:8080/connection?id=CONN-106"
 
 ## 6. 产物与血缘
 
+日账、隔离、血缘是**不可变文档**，按规范化 JSON 的 SHA-256 存进内容寻址对象库；
+发布目录只保存一份很小的manifest，记录本次发布所引用的各类索引树根 id：
+
 ```
-data/publications/
-├── current.json                     # 指针 + 累积墓碑
-└── pub-full-20261118xxxxxx-xxxxxx/
-    ├── daily-accounts.jsonl         # 日账（每日用量 Wh/kWh、边界读数、读数清单）
-    ├── quarantines.jsonl            # 隔离结果（原因码、中文说明、证据）
-    ├── lineage.jsonl                # 血缘（接电/读数出处、输入文件清单与哈希）
-    └── manifest.json                # 发布清单（模式、计数、撤下、告警、指纹）
+data/
+├── store/
+│   ├── blobs/<前2位>/<sha256>.json               # 日账 / 隔离 / 血缘（内容相同只存一份）
+│   └── trees/<命名空间>/nodes/<前2位>/<id>.json  # accounts / quarantines / lineage / filelists
+│                                                 # + manifest-recomputed / -carried / -withdrawn
+└── publications/
+    ├── current.json                              # 指针 + 累积墓碑（原子 rename）
+    └── pub-full-20261118xxxxxx-xxxxxx/
+        └── manifest.json                         # 模式、计数、指纹、各树根 id（约 1 KB）
 ```
 
 每条日账与隔离结果都有对应血缘文档，记录所依据的原始文件名、行号、记录 id、修订版本及
-文件 SHA-256，可完整追溯到原始记录及其修订版本。
+文件 SHA-256，可完整追溯到原始记录及其修订版本。血缘不再逐条内联「输入文件清单」，
+而是记录清单快照的树根 `fileListRoot`，查询时一次性展开（旧的 JSONL 发布仍原样兼容）。
+
+发布清单本身也保持恒定大小：整批输入文件清单、本版重算/沿用/撤下的 id 集合都落成
+内容寻址树，manifest 只存根 id；读取时按根展开，HTTP 响应形状不变。
+
+### 清单/索引的增量增长
+
+索引、文件清单、manifest 内的 id 集合都是按键哈希的十六进制位分叉的前缀树，
+节点内容以 SHA-256 寻址：
+
+- 每版只增一个文件并回补一笔时，只改写树的一条路径（`O(log₁₆N)` 个节点）；
+- 清单规模翻倍后，单版新增的清单与索引字节平均最多增至 **1.5 倍**
+  （单元测试 + 端到端重跑测试覆盖）；
+- 相同输入重跑得到相同的树根 id，因此指纹不变、自动跳过重复发布。
+
+### 查询与恢复
+
+- 按发布号打开某历史发布，只需读取该发布的 manifest 与对应树根，**不逐版回放**；
+- 按 `docId` 点查血缘只下钻一条索引路径；
+- 发布先写不可变对象、再原子 rename 发布目录、最后切换 `current.json`，
+  中断只会留下无人引用的残留，上一完整发布始终可查；
+- 首发规模（2000 笔接电 + 2000 个小文件）在 `--max-old-space-size=192` 内完成。
 
 ## 7. 目录结构
 
@@ -146,11 +175,12 @@ src/
   units.ts       Wh/kWh 归一化与等值比较
   ingest.ts      双源扫描、哈希去重、修订合并、出处采集
   settlement.ts  边界校验、隔离判定、按自然日拆账
-  storage.ts     不可变发布、原子指针、墓碑、幂等指纹
+  objectstore.ts 内容寻址 blob 存储 + 持久化前缀树（索引/清单增量写入）
+  storage.ts     发布清单、原子指针、墓碑、幂等指纹、按索引查询
   pipeline.ts    全量/重跑编排、血缘构建
   server.ts      HTTP 快照查询接口
   cli.ts         命令行入口
-scripts/         夹具生成器与端到端演示
+scripts/         夹具生成器（含规模夹具）与端到端演示
 test/            node:test 测试
 fixtures/        双源夹具（run1 / run2 / all-in-one）
 ```

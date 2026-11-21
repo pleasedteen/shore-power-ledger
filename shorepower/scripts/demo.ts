@@ -95,7 +95,7 @@ async function main(): Promise<void> {
   const lin101 = pub1.lineage.find((l) => l.subjectDocId === 'DAILY-CONN-101-2026-11-03');
   checkTrue('日账血缘包含接电记录出处', (lin101?.connectionSources.length ?? 0) > 0);
   checkTrue('日账血缘包含读数出处', (lin101?.readingSources.length ?? 0) >= 3);
-  checkTrue('血缘记录输入文件清单', (lin101?.inputFiles.length ?? 0) >= 2);
+  checkTrue('血缘记录输入文件清单', (lin101?.inputFiles?.length ?? 0) >= 2);
   const lin103 = pub1.lineage.find((l) => l.subjectDocId === 'QUAR-CONN-103');
   checkTrue('隔离结果同样带血缘', !!lin103);
 
@@ -198,7 +198,9 @@ async function main(): Promise<void> {
 
   console.log('\n────────────── 演示小结 ──────────────');
   console.log(`工作目录（临时）：${work}`);
-  console.log('存储布局：data/publications/<pub-id>/{daily-accounts,quarantines,lineage}.jsonl + manifest.json');
+  console.log(
+    '存储布局：data/store/{blobs,trees} 内容寻址对象 + data/publications/<pub-id>/manifest.json（各树根 id）',
+  );
   if (failures === 0) {
     console.log('全部检查通过 ✅');
   } else {
